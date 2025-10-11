@@ -19,13 +19,42 @@ print("++++ Program Start ++++")
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
 
+
+def _resolve_path(raw_path, default_dir):
+    """Return an absolute, existing-friendly path.
+
+    ``config.json`` currently stores Windows-style absolute paths.  When the
+    project is cloned on another platform those locations do not exist, so the
+    training script immediately fails to load the dataset/output folder.  This
+    helper first expands environment variables and user tildes, then falls back
+    to resolving the path relative to ``default_dir`` if the requested location
+    is missing.
+    """
+
+    if not raw_path:
+        return default_dir
+
+    expanded = os.path.expanduser(os.path.expandvars(raw_path))
+    # On POSIX, Windows-style paths (e.g. ``C:\``) are considered absolute but
+    # still will not exist.  If the target is missing, treat it as relative to
+    # the repository directory so the configuration remains portable.
+    if os.path.exists(expanded):
+        return os.path.abspath(expanded)
+
+    fallback = os.path.join(default_dir, raw_path)
+    if os.path.exists(fallback):
+        return os.path.abspath(fallback)
+
+    basename_fallback = os.path.join(default_dir, os.path.basename(raw_path))
+    return os.path.abspath(basename_fallback)
+
 with open(config_path, "r") as f:
     config = json.load(f)
 print("-- config file loaded --")
 
 # Paths
-DATA_FILE = os.path.abspath(config["data_file"])
-OUTPUT_DIR = os.path.abspath(config.get("output_dir", os.path.join(script_dir, "results")))
+DATA_FILE = _resolve_path(config["data_file"], script_dir)
+OUTPUT_DIR = _resolve_path(config.get("output_dir", os.path.join(script_dir, "results")), script_dir)
 MODEL_PATH = os.path.abspath(os.path.join(OUTPUT_DIR, "mlp_model.pth"))
 PLOT_DIR = os.path.join(script_dir, "plots")
 
