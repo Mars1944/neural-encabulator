@@ -70,10 +70,67 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
+class FlexibleMLP(nn.Module):
+    def __init__(self, input_size, hidden_size, depth, num_classes, dropout=0.2, verbose=False):
+        super(FlexibleMLP, self).__init__()
+
+        layers = []
+        layer_info = []
+        in_features = input_size
+        current_size = hidden_size
+
+        for i in range(depth):
+            layers.append(nn.Linear(in_features, current_size))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            layer_info.append(f"Hidden Layer {i+1}: {in_features} → {current_size}, Dropout({dropout})")
+            in_features = current_size
+            current_size = max(current_size // 2, num_classes)
+
+        layers.append(nn.Linear(in_features, num_classes))
+        layer_info.append(f"Output Layer: {in_features} → {num_classes}")
+
+        self.network = nn.Sequential(*layers)
+        self.layer_info = layer_info
+
+        if verbose:
+            self.print_architecture()
+
+    def forward(self, x):
+        return self.network(x)
+
+    def print_architecture(self):
+        print("\n🧩 FlexibleMLP Architecture:")
+        print("────────────────────────────")
+        for layer in self.layer_info:
+            print(layer)
+        print("────────────────────────────\n")
+
+
 input_size = X.shape[1]
 hidden_size = config.get("hidden_size", 64)
+depth = config.get("depth", 3)
+dropout = config.get("dropout", 0.3)
+model_set = config.get("model_set", 0)
 num_classes = config.get("num_classes", len(label_encoder.classes_))
-model = MLP(input_size, hidden_size, num_classes).to(device)
+
+if model_set == 0:
+    model = MLP(input_size, hidden_size, num_classes).to(device)
+    print(f"Standard MLP selected: hidden_size={hidden_size}")
+else:
+    model = FlexibleMLP(
+        input_size,
+        hidden_size,
+        depth,
+        num_classes,
+        dropout=dropout,
+        verbose=False,
+    ).to(device)
+    print(
+        "Flexible MLP selected: "
+        f"hidden_size={hidden_size}, depth={depth}, dropout={dropout}"
+    )
 
 # ===============================================================
 # === Load trained model ===
