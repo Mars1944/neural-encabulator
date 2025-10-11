@@ -165,6 +165,7 @@ for epoch in range(epochs):
     model.train()
     permutation = torch.randperm(X_train_tensor.size(0))
     epoch_loss = 0.0
+    batch_count = 0
 
     for i in range(0, X_train_tensor.size(0), batch_size):
         optimizer.zero_grad()
@@ -177,8 +178,9 @@ for epoch in range(epochs):
         optimizer.step()
 
         epoch_loss += loss.item()
+        batch_count += 1
 
-    avg_loss = epoch_loss / len(X_train_tensor)
+    avg_loss = epoch_loss / batch_count if batch_count > 0 else 0.0
     loss_history.append(avg_loss)
 
     # Validation accuracy each epoch
