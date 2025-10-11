@@ -58,15 +58,30 @@ for combo in tqdm(param_combinations, desc="Auto-training", unit="config"):
         text=True
     )
 
-    # --- Extract accuracy robustly ---
+    # --- Extract metrics from training output ---
     accuracy = None
+    loss_history = []
+    accuracy_history = []
+    epoch_pattern = re.compile(
+        r"Epoch \[(\d+)/(\d+)\] - Loss: ([0-9.]+), Accuracy: ([0-9.]+)"
+    )
+
     for line in result.stdout.splitlines():
         match = re.search(r"Final Accuracy[:\s]+([0-9.]+)", line)
-        if match:
+        if match and accuracy is None:
             try:
                 accuracy = float(match.group(1))
             except ValueError:
                 accuracy = 0.0
+
+        epoch_match = epoch_pattern.search(line)
+        if epoch_match:
+            try:
+                loss_history.append(float(epoch_match.group(3)))
+                accuracy_history.append(float(epoch_match.group(4)))
+            except ValueError:
+                # Skip malformed metrics but continue parsing other lines
+                pass
 
     if accuracy is None:
         print("⚠ Warning: Accuracy not found. Setting to 0.0")
@@ -81,12 +96,18 @@ for combo in tqdm(param_combinations, desc="Auto-training", unit="config"):
 
     # --- Generate and save plot ---
     hyperparams = {name: value for name, value in zip(param_names, combo)}
-    # Create descriptive filename
-    plot_filename = "_".join([f"{k}{v}" for k, v in hyperparams.items()]) + ".png"
-    plot_path = os.path.join(PLOT_DIR, plot_filename)
-
-    # Call the drop-in plot function
-    # Here we pass empty lists for loss/accuracy if you don't have them per epoch
-    plot_training_results(loss_history=[], accuracy_history=[accuracy], hyperparams=hyperparams, output_file=plot_path)
+    if loss_history and accuracy_history:
+        plot_filename = "_".join([f"{k}{v}" for k, v in hyperparams.items()]) + ".png"
+        plot_path = os.path.join(PLOT_DIR, plot_filename)
+        plot_training_results(
+            loss_history=loss_history,
+            accuracy_history=accuracy_history,
+            hyperparams=hyperparams,
+            output_file=plot_path,
+        )
+    else:
+        tqdm.write(
+            "ℹ️ No epoch-wise metrics captured; skipping auto-train plot for this run."
+        )
 
 print(f"\n=== Auto-training complete! Results saved to: {LOG_FILE} and plots in {PLOT_DIR} ===")

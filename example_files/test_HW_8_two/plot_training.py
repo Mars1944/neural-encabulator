@@ -11,15 +11,27 @@ import numpy as np
 from sklearn.metrics import r2_score
 
 
-def plot_training_results(loss_history, accuracy_history, hyperparams, output_dir="plots"):
+def plot_training_results(
+    loss_history,
+    accuracy_history,
+    hyperparams,
+    output_dir="plots",
+    output_file=None,
+):
     """
     Plot training loss and accuracy over epochs, including:
       - Best polynomial trendline for accuracy (order ≤ 10)
       - R² value and polynomial equation displayed on the plot
       - Hyperparameters printed in title and filename
+    Optionally accepts ``output_file`` to fully control the save path;
+    otherwise saves into ``output_dir`` with an auto-generated name.
     """
 
-    os.makedirs(output_dir, exist_ok=True)
+    if output_file:
+        plot_dir = os.path.dirname(output_file) or "."
+        os.makedirs(plot_dir, exist_ok=True)
+    else:
+        os.makedirs(output_dir, exist_ok=True)
 
     # Ensure data consistency
     if len(loss_history) == 0 or len(accuracy_history) == 0:
@@ -122,8 +134,11 @@ def plot_training_results(loss_history, accuracy_history, hyperparams, output_di
     # ===============================================================
     # === Save figure ===
     # ===============================================================
-    filename = f"training_plot_{'_'.join([f'{k}{v}' for k, v in hyperparams.items()])}.png"
-    plot_path = os.path.join(output_dir, filename)
+    if output_file:
+        plot_path = output_file
+    else:
+        filename = f"training_plot_{'_'.join([f'{k}{v}' for k, v in hyperparams.items()])}.png"
+        plot_path = os.path.join(output_dir, filename)
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
