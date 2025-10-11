@@ -41,73 +41,98 @@ if not os.path.exists(LOG_FILE):
 param_combinations = list(itertools.product(*param_grid.values()))
 
 # === Loop through configurations ===
-for combo in tqdm(param_combinations, desc="Auto-training", unit="config"):
-    # Update config
-    config = base_config.copy()
-    for name, value in zip(param_names, combo):
-        config[name] = value
+try:
+    for combo in tqdm(param_combinations, desc="Auto-training", unit="config"):
+        # Update config
+        config = base_config.copy()
+        for name, value in zip(param_names, combo):
+            config[name] = value
 
-    # Save config temporarily
+        # Save config temporarily
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=4)
+
+        # Run training script
+        result = subprocess.run(
+            ["python", TRAIN_SCRIPT],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            tqdm.write(
+                f"❌ Training failed for config {combo} (exit code {result.returncode})."
+            )
+            if result.stderr:
+                tqdm.write(result.stderr.strip())
+            accuracy = None
+            loss_history = []
+            accuracy_history = []
+        else:
+            # --- Extract metrics from training output ---
+            accuracy = None
+            loss_history = []
+            accuracy_history = []
+            epoch_pattern = re.compile(
+                r"Epoch \[(\d+)/(\d+)\] - Loss: ([0-9.]+), Accuracy: ([0-9.]+)"
+            )
+
+            for line in result.stdout.splitlines():
+                match = re.search(r"Final Accuracy[:\s]+([0-9.]+)", line)
+                if match and accuracy is None:
+                    try:
+                        accuracy = float(match.group(1))
+                    except ValueError:
+                        accuracy = None
+
+                epoch_match = epoch_pattern.search(line)
+                if epoch_match:
+                    try:
+                        loss_history.append(float(epoch_match.group(3)))
+                        accuracy_history.append(float(epoch_match.group(4)))
+                    except ValueError:
+                        # Skip malformed metrics but continue parsing other lines
+                        pass
+
+            if accuracy is None:
+                tqdm.write(
+                    f"⚠️ Accuracy not reported for config {combo}; marking as unknown."
+                )
+
+        # --- Log results ---
+        with open(LOG_FILE, "a", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(
+                list(combo)
+                + ["FAILED" if accuracy is None else f"{accuracy:.6f}", datetime.now().isoformat()]
+            )
+
+        if accuracy is not None:
+            tqdm.write(f"✔ Config {combo} completed. Accuracy = {accuracy:.4f}")
+        else:
+            tqdm.write(f"⚠️ Config {combo} recorded without a valid accuracy.")
+
+        # --- Generate and save plot ---
+        hyperparams = {name: value for name, value in zip(param_names, combo)}
+        if accuracy is not None and loss_history and accuracy_history:
+            plot_filename = "_".join([f"{k}{v}" for k, v in hyperparams.items()]) + ".png"
+            plot_path = os.path.join(PLOT_DIR, plot_filename)
+            plot_training_results(
+                loss_history=loss_history,
+                accuracy_history=accuracy_history,
+                hyperparams=hyperparams,
+                output_file=plot_path,
+            )
+        elif accuracy is not None:
+            tqdm.write(
+                "ℹ️ No epoch-wise metrics captured; skipping auto-train plot for this run."
+            )
+
+finally:
     with open(config_path, "w") as f:
-        json.dump(config, f, indent=4)
+        json.dump(base_config, f, indent=4)
+    print("\n-- Base config restored after auto-training --")
 
-    # Run training script
-    result = subprocess.run(
-        ["python", TRAIN_SCRIPT],
-        capture_output=True,
-        text=True
-    )
-
-    # --- Extract metrics from training output ---
-    accuracy = None
-    loss_history = []
-    accuracy_history = []
-    epoch_pattern = re.compile(
-        r"Epoch \[(\d+)/(\d+)\] - Loss: ([0-9.]+), Accuracy: ([0-9.]+)"
-    )
-
-    for line in result.stdout.splitlines():
-        match = re.search(r"Final Accuracy[:\s]+([0-9.]+)", line)
-        if match and accuracy is None:
-            try:
-                accuracy = float(match.group(1))
-            except ValueError:
-                accuracy = 0.0
-
-        epoch_match = epoch_pattern.search(line)
-        if epoch_match:
-            try:
-                loss_history.append(float(epoch_match.group(3)))
-                accuracy_history.append(float(epoch_match.group(4)))
-            except ValueError:
-                # Skip malformed metrics but continue parsing other lines
-                pass
-
-    if accuracy is None:
-        print("⚠ Warning: Accuracy not found. Setting to 0.0")
-        accuracy = 0.0
-
-    # --- Log results ---
-    with open(LOG_FILE, "a", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(list(combo) + [accuracy, datetime.now().isoformat()])
-
-    tqdm.write(f"✔ Config {combo} completed. Accuracy = {accuracy:.4f}")
-
-    # --- Generate and save plot ---
-    hyperparams = {name: value for name, value in zip(param_names, combo)}
-    if loss_history and accuracy_history:
-        plot_filename = "_".join([f"{k}{v}" for k, v in hyperparams.items()]) + ".png"
-        plot_path = os.path.join(PLOT_DIR, plot_filename)
-        plot_training_results(
-            loss_history=loss_history,
-            accuracy_history=accuracy_history,
-            hyperparams=hyperparams,
-            output_file=plot_path,
-        )
-    else:
-        tqdm.write(
-            "ℹ️ No epoch-wise metrics captured; skipping auto-train plot for this run."
-        )
-
-print(f"\n=== Auto-training complete! Results saved to: {LOG_FILE} and plots in {PLOT_DIR} ===")
+print(
+    f"\n=== Auto-training complete! Results saved to: {LOG_FILE} and plots in {PLOT_DIR} ==="
+)

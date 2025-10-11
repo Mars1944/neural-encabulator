@@ -15,13 +15,31 @@ print("++++ Program Start ++++")
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
 
+
+def _resolve_path(raw_path, default_dir):
+    """Mirror the trainer's path resolution logic for cross-platform runs."""
+
+    if not raw_path:
+        return default_dir
+
+    expanded = os.path.expanduser(os.path.expandvars(raw_path))
+    if os.path.exists(expanded):
+        return os.path.abspath(expanded)
+
+    fallback = os.path.join(default_dir, raw_path)
+    if os.path.exists(fallback):
+        return os.path.abspath(fallback)
+
+    basename_fallback = os.path.join(default_dir, os.path.basename(raw_path))
+    return os.path.abspath(basename_fallback)
+
 with open(config_path, "r") as f:
     config = json.load(f)
 print("-- config file loaded --")
 
 # Paths
-DATA_FILE = os.path.abspath(config["data_file"])
-OUTPUT_DIR = os.path.abspath(config.get("output_dir", os.path.join(script_dir, "results")))
+DATA_FILE = _resolve_path(config["data_file"], script_dir)
+OUTPUT_DIR = _resolve_path(config.get("output_dir", os.path.join(script_dir, "results")), script_dir)
 MODEL_PATH = os.path.abspath(os.path.join(OUTPUT_DIR, "mlp_model.pth"))
 ENCODER_PATH = os.path.join(OUTPUT_DIR, "label_encoder.pkl")
 
