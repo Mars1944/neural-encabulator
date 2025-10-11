@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import torch
 import torch.nn as nn
@@ -9,35 +10,35 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score, confusion_matrix
 import joblib
-from datetime import datetime
 
 print("++++ Program Start ++++")
+
+# Ensure UTF-8 capable stdout/stderr to avoid Windows cp1252 errors
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 # ===============================================================
 # === Load Config ===
 # ===============================================================
 script_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(script_dir, "config.json")
+op_config_path = os.path.join(script_dir, "op_config.json")
 
 
 def _resolve_path(raw_path, default_dir):
     """Return an absolute, existing-friendly path.
 
-    ``config.json`` currently stores Windows-style absolute paths.  When the
-    project is cloned on another platform those locations do not exist, so the
-    training script immediately fails to load the dataset/output folder.  This
-    helper first expands environment variables and user tildes, then falls back
-    to resolving the path relative to ``default_dir`` if the requested location
-    is missing.
+    If the configured path does not exist, fall back to resolving it
+    relative to default_dir, then to basename in default_dir.
     """
 
     if not raw_path:
         return default_dir
 
     expanded = os.path.expanduser(os.path.expandvars(raw_path))
-    # On POSIX, Windows-style paths (e.g. ``C:\``) are considered absolute but
-    # still will not exist.  If the target is missing, treat it as relative to
-    # the repository directory so the configuration remains portable.
     if os.path.exists(expanded):
         return os.path.abspath(expanded)
 
@@ -48,9 +49,17 @@ def _resolve_path(raw_path, default_dir):
     basename_fallback = os.path.join(default_dir, os.path.basename(raw_path))
     return os.path.abspath(basename_fallback)
 
-with open(config_path, "r") as f:
+
+# Toggle to prefer the optimal config produced by auto_train.py
+USE_OPTIMAL_CONFIG = True  # set True or use env var USE_OP_CONFIG=1
+_env = os.environ.get("USE_OP_CONFIG")
+if _env is not None:
+    USE_OPTIMAL_CONFIG = _env.strip().lower() in {"1", "true", "yes", "on"}
+
+active_config_path = op_config_path if (USE_OPTIMAL_CONFIG and os.path.exists(op_config_path)) else config_path
+with open(active_config_path, "r") as f:
     config = json.load(f)
-print("-- config file loaded --")
+print(f"-- config file loaded -- ({os.path.basename(active_config_path)})")
 
 # Paths
 DATA_FILE = _resolve_path(config["data_file"], script_dir)
@@ -71,7 +80,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("-- device setup --")
 print(f"Using device: {device}")
 if device.type == "cuda":
-    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+    try:
+        print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+    except Exception:
+        pass
 
 # ===============================================================
 # === Load dataset ===
@@ -126,25 +138,25 @@ class FlexibleMLP(nn.Module):
         super(FlexibleMLP, self).__init__()
 
         layers = []
-        layer_info = []
         in_features = input_size
         current_size = hidden_size
 
         # Build hidden layers with decay
+        layer_info_ascii = []
         for i in range(depth):
             layers.append(nn.Linear(in_features, current_size))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
-            layer_info.append(f"Hidden Layer {i+1}: {in_features} → {current_size}, Dropout({dropout})")
+            layer_info_ascii.append(f"Hidden Layer {i+1}: {in_features} -> {current_size}, Dropout({dropout})")
             in_features = current_size
             current_size = max(current_size // 2, num_classes)
 
         # Output layer
         layers.append(nn.Linear(in_features, num_classes))
-        layer_info.append(f"Output Layer: {in_features} → {num_classes}")
+        layer_info_ascii.append(f"Output Layer: {in_features} -> {num_classes}")
 
         self.network = nn.Sequential(*layers)
-        self.layer_info = layer_info
+        self.layer_info = layer_info_ascii
 
         if verbose:
             self.print_architecture()
@@ -153,11 +165,12 @@ class FlexibleMLP(nn.Module):
         return self.network(x)
 
     def print_architecture(self):
-        print("\n🧩 FlexibleMLP Architecture:")
-        print("────────────────────────────")
+        print("\nFlexibleMLP Architecture:")
+        print("-------------------------")
         for layer in self.layer_info:
             print(layer)
-        print("────────────────────────────\n")
+        print("-------------------------\n")
+
 
 # ===============================================================
 # === Initialize Model ===
@@ -176,7 +189,7 @@ if model_set == 0:
     model = MLP(input_size, hidden_size, num_classes).to(device)
     print(f"Standard MLP selected: hidden_size={hidden_size}")
 else:
-    model = FlexibleMLP(input_size, hidden_size, depth, num_classes, dropout=dropout).to(device)
+    model = FlexibleMLP(input_size, hidden_size, depth, num_classes, dropout=dropout, verbose=False).to(device)
     print(f"Flexible MLP selected: hidden_size={hidden_size}, depth={depth}, dropout={dropout}")
 
 # ===============================================================
@@ -236,7 +249,7 @@ acc = accuracy_score(y_true, y_pred)
 cm = confusion_matrix(y_true, y_pred)
 
 print("\n==============================")
-print("✅ Evaluation Complete!")
+print("Evaluation Complete!")
 print(f"Overall Accuracy: {acc*100:.2f}%")
 print("Confusion Matrix:\n", cm)
 print("==============================\n")
@@ -254,7 +267,7 @@ hyperparams = {
     "hidden_size": hidden_size,
     "lr": learning_rate,
     "depth": depth,
-    "dropout": dropout
+    "dropout": dropout,
 }
 
 plot_path = plot_training_results(loss_history, accuracy_history, hyperparams, output_dir=PLOT_DIR)
@@ -264,7 +277,8 @@ print(f"Training plots saved to: {plot_path}")
 # === Final Output for Auto-Trainer ===
 # ===============================================================
 print("==============================")
-print("✅ Training complete!")
+print("Training complete!")
 print(f"Final Accuracy: {acc:.4f}")  # <-- Auto-trainer reads this
 print("==============================")
 print("++++ Program End ++++")
+

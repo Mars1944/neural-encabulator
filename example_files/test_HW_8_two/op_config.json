@@ -8,32 +8,36 @@
     "hidden_size": 32,
     "learning_rate": 0.001,
     "num_classes": 3,
-    "depth": 3,
+    "depth": 2,
     "model_set": 0,
     "auto_train": {
         "hidden_size": [
-            32,
-            64,
-            128
+            32
         ],
         "learning_rate": [
-            0.001,
-            0.0005,
-            0.0001
+            0.001
         ],
         "depth": [
-            2,
-            3,
-            4
+            2
         ],
         "dropout": [
-            0.2,
-            0.3
+            0.2
         ],
         "hold_constant": [
             "batch_size",
             "epochs"
         ]
     },
-    "dropout": 0.2
+    "dropout": 0.2,
+    "auto_train_summary": {
+        "best_accuracy": 0.7429,
+        "selected_hyperparameters": {
+            "hidden_size": 32,
+            "learning_rate": 0.001,
+            "depth": 2,
+            "dropout": 0.2
+        },
+        "timestamp": "2025-10-11T16:48:57.329784",
+        "source": "auto_train.py"
+    }
 }
