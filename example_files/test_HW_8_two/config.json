@@ -1,16 +1,20 @@
 {
-    "data_file": "c:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural-encabulator/example_files/test_HW_8_two/glass_data_HW11.csv",
-    "output_dir": "c:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural-encabulator/example_files/test_HW_8_two/results",
-    "model_path": "c:\\Users\\Owner\\Documents\\Grad School\\Fall 2025\\ME 521 - CPTS 534 Project\\neural-encabulator\\example_files\\test_HW_8_two\\results\\mlp_model.pth",
+  "data_file": "c:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural-encabulator/example_files/test_HW_8_two/glass_data_HW11.csv",
+  "output_dir": "c:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural-encabulator/example_files/test_HW_8_two/results",
+  "model_path": "c:\\Users\\Owner\\Documents\\Grad School\\Fall 2025\\ME 521 - CPTS 534 Project\\neural-encabulator\\example_files\\test_HW_8_two\\results\\mlp_model.pth",
+  "cv_folds": 5,
+  "epochs": 200,
+  "batch_size": 16,
+  "hidden_size": 64,
+  "learning_rate": 0.001,
+  "num_classes": 3,
+  "depth": 3,
+  "model_set": 0,
 
-    "cv_folds": 5,
-    "epochs": 200,
-    "batch_size": 8,
-    "hidden_size": 64,
-    "learning_rate": 0.001,
-    "num_classes": 3,
-
-    "model_set": 0,
-    "depth": 4,
-    "dropout": 0.3
+  "auto_train": {
+    "hidden_size": [32, 64, 128],
+    "learning_rate": [0.01, 0.001, 0.0005],
+    "depth": [2, 3, 4],
+    "hold_constant": ["batch_size", "epochs"]
+  }
 }
