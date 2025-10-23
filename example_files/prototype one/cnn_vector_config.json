@@ -1,0 +1,51 @@
+{
+  "_doc": {
+    "model_type": "Selects the runner path. 'cnn' builds the CNN pipeline (not FT-Transformer).",
+    "num_classes": "Final classifier output width — set to your number of labels.",
+    "seed": "Random seed for Python/NumPy/Torch to improve reproducibility.",
+    "device": "'auto' prefers CUDA -> MPS -> CPU; override with 'cpu'/'cuda'/'mps'.",
+    "field_path": "Path to .npy/.npz vector field. Enables vector-field tiling mode.",
+    "tile_size": "[th, tw] tile height/width. Larger = more context, more memory.",
+    "tile_stride": "[sh, sw] step between tiles. Smaller than tile_size gives overlap.",
+    "add_magnitude": "If true and C>=2, appends |v| as an extra channel. Helps capture strength.",
+    "normalize": "Per-channel z-score normalization for stability (recommended).",
+    "limit_tiles": "Optional cap on number of tiles to load (useful for quick tests).",
+    "conv_channels": "Channels per conv block; deeper/wider increases capacity and compute.",
+    "kernel_size": "Conv kernel size (typical: 3 or 5). Larger increases local receptive field.",
+    "pool_every": "Insert MaxPool2d(2) after this many conv blocks; more pooling = more global context.",
+    "dilations": "Int or list per block. Dilation >1 expands receptive field without downsampling.",
+    "use_batchnorm": "Apply BatchNorm after conv; stabilizes training, often allows higher LR.",
+    "dropout": "Dropout probability in conv blocks for regularization.",
+    "learning_rate": "AdamW learning rate; start ~1e-3 and tune.",
+    "weight_decay": "AdamW weight decay (L2) for regularization."
+  },
+  "_tips": [
+    "Receptive field = kernel_size + dilations + pooling; for large structures try dilations like [1,2,4,8]",
+    "Reduce tile_stride below tile_size for overlap to better capture boundary-spanning features",
+    "With add_magnitude=true, a 2-channel field (u,v) becomes 3 channels (u,v,|v|)",
+    "You can precompute extra channels (e.g., divergence/curl) and save them in the .npy; they will be ingested",
+    "Use limit_tiles during prototyping to control memory/iteration time"
+  ],
+  "seed": 42,
+  "device": "auto",
+  "model_type": "cnn",
+
+  "num_classes": 2,
+
+  "conv_channels": [32, 64, 128, 256],
+  "kernel_size": 3,
+  "pool_every": 1,
+  "dropout": 0.1,
+  "use_batchnorm": true,
+  "dilations": [1, 2, 4, 4],
+
+  "learning_rate": 0.001,
+  "weight_decay": 0.0,
+
+  "field_path": "REPLACE_WITH_PATH_TO_FIELD.npy",
+  "tile_size": [256, 256],
+  "tile_stride": [256, 256],
+  "add_magnitude": true,
+  "normalize": true,
+  "limit_tiles": 64
+}
