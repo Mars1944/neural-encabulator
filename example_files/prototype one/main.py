@@ -24,10 +24,12 @@ class AppSetup:
             raise FileNotFoundError(f"Config file not found: {config_path}")
         self.config_path = config_path
         self.cfg: Dict[str, Any] = self._load_config(self.config_path)
-        self.device: str = self.choose_device(str(self.cfg.get("device", "auto")))
+        self._validate_and_normalize_cfg()
+        self.device: torch.device = self.choose_device(str(self.cfg.get("device", "auto")))
         self.set_seed(int(self.cfg.get("seed", 42)))
+        self._apply_runtime_flags()
         print(f"Loaded config from: {self.config_path}")
-        print(f"Using device: {self.device}")
+        print(f"Using device: {self.format_device_info(self.device)}")
 
     @staticmethod
     def _load_config(path: Path) -> Dict[str, Any]:
@@ -35,31 +37,158 @@ class AppSetup:
             return json.load(f)
 
     @staticmethod
-    def choose_device(pref: str) -> str:
-        p = pref.lower()
-        if p == "cuda":
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        if p == "cpu":
-            return "cpu"
+    def choose_device(pref: str | None) -> torch.device:
+        p = (pref or "auto").lower()
+
+        def mps_available() -> bool:
+            return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+        def cuda_available(idx: int | None = None) -> bool:
+            if not torch.cuda.is_available():
+                return False
+            if idx is None:
+                return True
+            try:
+                return 0 <= idx < torch.cuda.device_count()
+            except Exception:
+                return False
+
+        if p.startswith("cuda"):
+            idx: int | None = None
+            if ":" in p:
+                try:
+                    idx = int(p.split(":", 1)[1])
+                except Exception:
+                    idx = None
+            if cuda_available(idx):
+                return torch.device(f"cuda:{idx}" if idx is not None else "cuda")
+            print(f"[warn] Requested CUDA device '{pref}' not available; falling back to CPU")
+            return torch.device("cpu")
+
         if p == "mps":
-            return (
-                "mps"
-                if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-                else "cpu"
-            )
-        if torch.cuda.is_available():
+            if mps_available():
+                return torch.device("mps")
+            print("[warn] Requested MPS device but it's not available; using CPU")
+            return torch.device("cpu")
+
+        if p == "cpu":
+            return torch.device("cpu")
+
+        # auto preference order
+        if cuda_available():
+            return torch.device("cuda")
+        if mps_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    @staticmethod
+    def format_device_info(device: torch.device) -> str:
+        if device.type == "cuda":
+            try:
+                idx = device.index if device.index is not None else (
+                    torch.cuda.current_device() if torch.cuda.is_available() else None
+                )
+                if idx is not None:
+                    name = torch.cuda.get_device_name(idx)
+                    return f"cuda:{idx} ({name})"
+            except Exception:
+                pass
             return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
+        if device.type == "mps":
+            return "mps (Apple Silicon)"
         return "cpu"
 
     @staticmethod
     def set_seed(seed: int) -> None:
         random.seed(seed)
-        # NumPy not required here; seeding torch covers most stochasticity
+        # Also seed NumPy if available (useful for any pre-tensor randomness)
+        try:
+            import numpy as np  # type: ignore
+
+            np.random.seed(seed)
+        except Exception:
+            pass
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+
+    def _apply_runtime_flags(self) -> None:
+        # Determinism and precision controls (optional)
+        deterministic = bool(self.cfg.get("deterministic", False))
+        try:
+            torch.use_deterministic_algorithms(deterministic)
+        except Exception:
+            pass
+        try:
+            import torch.backends.cudnn as cudnn  # type: ignore
+
+            cudnn.deterministic = deterministic
+            cudnn.benchmark = not deterministic
+        except Exception:
+            pass
+        # Float32 matmul precision (PyTorch 2.x): 'high' | 'medium' | 'default'
+        prec = str(self.cfg.get("matmul_precision", "default")).lower()
+        try:
+            if prec in {"high", "medium", "default"}:
+                torch.set_float32_matmul_precision(prec)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _validate_and_normalize_cfg(self) -> None:
+        # Minimal schema checks + defaults + warnings for unknown keys
+        cfg = self.cfg
+        expected: Dict[str, str] = {
+            "seed": "int",
+            "device": "str",
+            "model_type": "str",
+            "num_classes": "int",
+            "conv_channels": "list[int]",
+            "kernel_size": "int",
+            "pool_every": "int",
+            "dropout": "float",
+            "use_batchnorm": "bool",
+            "dilations": "int|list[int]",
+            "learning_rate": "float",
+            "weight_decay": "float",
+            "field_path": "str",
+            "tile_size": "list[int,int]",
+            "tile_stride": "list[int,int]",
+            "add_magnitude": "bool",
+            "normalize": "bool",
+            "limit_tiles": "int|null",
+            "deterministic": "bool",
+            "matmul_precision": "str",
+        }
+        # Warn on unknown keys
+        for k in list(cfg.keys()):
+            if k not in expected:
+                print(f"[warn] Unknown config key: '{k}'")
+        # Fill defaults commonly needed
+        cfg.setdefault("model_type", "cnn")
+        cfg.setdefault("num_classes", 2)
+        cfg.setdefault("conv_channels", [32, 64, 128])
+        cfg.setdefault("kernel_size", 3)
+        cfg.setdefault("pool_every", 1)
+        cfg.setdefault("dropout", 0.0)
+        cfg.setdefault("use_batchnorm", True)
+        cfg.setdefault("learning_rate", 1e-3)
+        cfg.setdefault("weight_decay", 0.0)
+        cfg.setdefault("tile_size", [256, 256])
+        # Basic type/shape validations (non-fatal -> raise with context)
+        try:
+            ts = cfg.get("tile_size", [256, 256])
+            if not (isinstance(ts, (list, tuple)) and len(ts) == 2):
+                raise ValueError("tile_size must be [h, w]")
+            if any(int(x) <= 0 for x in ts):
+                raise ValueError("tile_size entries must be positive")
+            stride = cfg.get("tile_stride", None)
+            if stride is not None:
+                if not (isinstance(stride, (list, tuple)) and len(stride) == 2):
+                    raise ValueError("tile_stride must be [sh, sw] when provided")
+                if any(int(x) <= 0 for x in stride):
+                    raise ValueError("tile_stride entries must be positive")
+        except Exception as e:
+            raise ValueError(f"Config validation error: {e}")
 
 
 class ModelManager:
