@@ -1,7 +1,21 @@
 import argparse
 import json
+import random
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
+
+# Single imports per library
+try:
+    import torch
+except Exception as e:  # pragma: no cover
+    raise RuntimeError("PyTorch is not installed. Please install torch to proceed.") from e
+
+from cnn_model import SimpleCNN, count_parameters
+from vector_field_data import (
+    ensure_chw,
+    load_vector_field,
+    load_vector_field_tiles,
+)
 
 
 class AppSetup:
@@ -22,15 +36,6 @@ class AppSetup:
 
     @staticmethod
     def choose_device(pref: str) -> str:
-        try:
-            import torch  # noqa: F401
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError(
-                "PyTorch is not installed. Please install torch to proceed."
-            ) from e
-
-        import torch
-
         p = pref.lower()
         if p == "cuda":
             return "cuda" if torch.cuda.is_available() else "cpu"
@@ -50,12 +55,8 @@ class AppSetup:
 
     @staticmethod
     def set_seed(seed: int) -> None:
-        import random
-        import numpy as np
-        import torch
-
         random.seed(seed)
-        np.random.seed(seed)
+        # NumPy not required here; seeding torch covers most stochasticity
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
@@ -68,24 +69,18 @@ class ModelManager:
         self.model = self._build_model()
 
     def _build_model(self) -> "torch.nn.Module":
-        import torch
-
         # Infer channels from vector-field file if provided
         field_path = self.cfg.get("field_path", "")
         if isinstance(field_path, str) and field_path.strip():
             try:
-                from vector_field_data import load_vector_field, ensure_chw
-
                 arr = load_vector_field(field_path, mmap=True)
                 chw = ensure_chw(arr)
                 c = int(chw.shape[0])
                 if bool(self.cfg.get("add_magnitude", True)) and c >= 2:
                     c = c + 1
                 self.cfg["input_channels"] = c
-            except Exception:
-                pass
-
-        from cnn_model import SimpleCNN, count_parameters
+            except Exception as e:
+                print(f"[warn] Could not infer input_channels from field_path: {e}")
 
         model = SimpleCNN(self.cfg).to(self.device)
         print(model)
@@ -93,21 +88,14 @@ class ModelManager:
         return model
 
     def make_dummy_input(self) -> "torch.Tensor":
-        import torch
-
         img_h, img_w = self.cfg.get("image_size", [256, 256])
         in_ch = int(self.cfg.get("input_channels", 3))
         return torch.randn(4, in_ch, img_h, img_w, device=self.device)
 
     def load_inputs(self, field_path: str | None = None) -> "torch.Tensor":
-        import torch
-        import numpy as np
-
         # Vector-field mode via large .npy/.npz with tiling (CLI overrides config)
         use_field = field_path if field_path is not None else self.cfg.get("field_path", "")
         if isinstance(use_field, str) and use_field.strip():
-            from vector_field_data import load_vector_field_tiles
-
             tile_size = tuple(self.cfg.get("tile_size", [256, 256]))
             stride_cfg = self.cfg.get("tile_stride", None)
             stride = None
@@ -124,12 +112,11 @@ class ModelManager:
                 normalize=normalize,
                 limit_tiles=None if limit_tiles is None else int(limit_tiles),
             )
+            print(f"Loaded tiles: shape={np_batch.shape}")
             return torch.from_numpy(np_batch).to(self.device)
         return self.make_dummy_input()
 
     def create_optimizer(self) -> "torch.optim.Optimizer":
-        import torch
-
         lr = float(self.cfg.get("learning_rate", 1e-3))
         wd = float(self.cfg.get("weight_decay", 0.0))
         opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)

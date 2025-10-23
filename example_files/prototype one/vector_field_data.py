@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Tuple
 
 import numpy as np
 
@@ -112,4 +112,3 @@ def load_vector_field_tiles(
         raise RuntimeError("No tiles produced; check tile_size/stride relative to field size")
     batch = np.stack(tiles, axis=0).astype(np.float32)
     return batch
-

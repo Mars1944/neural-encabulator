@@ -1,9 +1,8 @@
 import torch
-import torch.nn as nn
 from typing import List, Sequence
 
 
-class ConvBlock(nn.Module):
+class ConvBlock(torch.nn.Module):
     def __init__(
         self,
         in_ch: int,
@@ -16,8 +15,8 @@ class ConvBlock(nn.Module):
         super().__init__()
         dilation = max(int(dilation), 1)
         padding = (kernel_size // 2) * dilation
-        layers: List[nn.Module] = [
-            nn.Conv2d(
+        layers: List[torch.nn.Module] = [
+            torch.nn.Conv2d(
                 in_ch,
                 out_ch,
                 kernel_size=kernel_size,
@@ -27,19 +26,19 @@ class ConvBlock(nn.Module):
             ),
         ]
         if use_batchnorm:
-            layers.append(nn.BatchNorm2d(out_ch))
+            layers.append(torch.nn.BatchNorm2d(out_ch))
         layers += [
-            nn.ReLU(inplace=True),
+            torch.nn.ReLU(inplace=True),
         ]
         if dropout and dropout > 0:
-            layers.append(nn.Dropout2d(p=dropout))
-        self.block = nn.Sequential(*layers)
+            layers.append(torch.nn.Dropout2d(p=dropout))
+        self.block = torch.nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         return self.block(x)
 
 
-class SimpleCNN(nn.Module):
+class SimpleCNN(torch.nn.Module):
     """
     A simple, configurable CNN.
 
@@ -69,7 +68,7 @@ class SimpleCNN(nn.Module):
         else:
             dilations = [max(int(dilations_cfg), 1)] * len(conv_channels)
 
-        features: List[nn.Module] = []
+        features: List[torch.nn.Module] = []
         last_ch = in_ch
         blocks_since_pool = 0
         for idx, out_ch in enumerate(conv_channels):
@@ -87,16 +86,16 @@ class SimpleCNN(nn.Module):
             last_ch = out_ch
             blocks_since_pool += 1
             if pool_every > 0 and blocks_since_pool >= pool_every:
-                features.append(nn.MaxPool2d(kernel_size=2, stride=2))
+                features.append(torch.nn.MaxPool2d(kernel_size=2, stride=2))
                 blocks_since_pool = 0
 
         # Ensure some spatial normalization regardless of conv stack
-        features.append(nn.AdaptiveAvgPool2d((1, 1)))
-        self.features = nn.Sequential(*features)
+        features.append(torch.nn.AdaptiveAvgPool2d((1, 1)))
+        self.features = torch.nn.Sequential(*features)
 
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(last_ch, max(num_classes, 1)),
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Flatten(),
+            torch.nn.Linear(last_ch, max(num_classes, 1)),
         )
 
         self.num_classes = num_classes
@@ -107,5 +106,5 @@ class SimpleCNN(nn.Module):
         return logits
 
 
-def count_parameters(model: nn.Module) -> int:
+def count_parameters(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
