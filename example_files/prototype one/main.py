@@ -4,13 +4,22 @@ import random
 from pathlib import Path
 from typing import Any, Dict
 
-# Single imports per library
+# Centralized optional imports
 try:
     import torch
 except Exception as e:  # pragma: no cover
     raise RuntimeError("PyTorch is not installed. Please install torch to proceed.") from e
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+try:
+    import torch.backends.cudnn as cudnn  # type: ignore
+except Exception:  # pragma: no cover
+    cudnn = None  # type: ignore
 
 from cnn_model import SimpleCNN, count_parameters
+from cnn_optim import CnnOptim
 from vector_field_data import (
     ensure_chw,
     load_vector_field,
@@ -102,12 +111,11 @@ class AppSetup:
     def set_seed(seed: int) -> None:
         random.seed(seed)
         # Also seed NumPy if available (useful for any pre-tensor randomness)
-        try:
-            import numpy as np  # type: ignore
-
-            np.random.seed(seed)
-        except Exception:
-            pass
+        if np is not None:
+            try:
+                np.random.seed(seed)  # type: ignore[attr-defined]
+            except Exception:
+                pass
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
@@ -119,13 +127,12 @@ class AppSetup:
             torch.use_deterministic_algorithms(deterministic)
         except Exception:
             pass
-        try:
-            import torch.backends.cudnn as cudnn  # type: ignore
-
-            cudnn.deterministic = deterministic
-            cudnn.benchmark = not deterministic
-        except Exception:
-            pass
+        if cudnn is not None:
+            try:
+                cudnn.deterministic = deterministic  # type: ignore[attr-defined]
+                cudnn.benchmark = not deterministic  # type: ignore[attr-defined]
+            except Exception:
+                pass
         # Float32 matmul precision (PyTorch 2.x): 'high' | 'medium' | 'default'
         prec = str(self.cfg.get("matmul_precision", "default")).lower()
         try:
@@ -246,10 +253,13 @@ class ModelManager:
         return self.make_dummy_input()
 
     def create_optimizer(self) -> "torch.optim.Optimizer":
-        lr = float(self.cfg.get("learning_rate", 1e-3))
-        wd = float(self.cfg.get("weight_decay", 0.0))
-        opt = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
-        print(f"Optimizer ready (AdamW, lr={lr}, weight_decay={wd}).")
+        # Class-based builder for optimizer/scheduler
+        builder = CnnOptim(self.cfg)
+        opt, sch, step_on = builder.build(self.model)
+        # Attach for optional external use
+        setattr(self, "optim_builder", builder)
+        setattr(self, "scheduler", sch)
+        setattr(self, "scheduler_step_on", step_on)
         return opt
 
 

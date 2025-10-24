@@ -13,11 +13,14 @@
     "conv_channels": "Channels per conv block; deeper/wider increases capacity and compute.",
     "kernel_size": "Conv kernel size (typical: 3 or 5). Larger increases local receptive field.",
     "pool_every": "Insert MaxPool2d(2) after this many conv blocks; more pooling = more global context.",
-    "dilations": "Int or list per block. Dilation >1 expands receptive field without downsampling.",
-    "use_batchnorm": "Apply BatchNorm after conv; stabilizes training, often allows higher LR.",
-    "dropout": "Dropout probability in conv blocks for regularization.",
-    "learning_rate": "AdamW learning rate; start ~1e-3 and tune.",
-    "weight_decay": "AdamW weight decay (L2) for regularization."
+  "dilations": "Int or list per block. Dilation >1 expands receptive field without downsampling.",
+  "use_batchnorm": "Apply BatchNorm after conv; stabilizes training, often allows higher LR.",
+  "dropout": "Dropout probability in conv blocks for regularization.",
+  "learning_rate": "AdamW learning rate; start ~1e-3 and tune.",
+  "weight_decay": "AdamW weight decay (L2) for regularization.",
+  "optimizer": "One of: adamw (default), adam, sgd, rmsprop.",
+  "scheduler": "LR schedule: none, cosine, step, plateau, warmup_cosine.",
+  "max_epochs": "Used by some schedulers (e.g., cosine/warmup_cosine)"
   },
   "_tips": [
     "Receptive field = kernel_size + dilations + pooling; for large structures try dilations like [1,2,4,8]",
@@ -41,6 +44,9 @@
 
   "learning_rate": 0.001,
   "weight_decay": 0.0,
+  "optimizer": "adamw",
+  "scheduler": "none",
+  "max_epochs": 50,
 
   "field_path": "REPLACE_WITH_PATH_TO_FIELD.npy",
   "tile_size": [256, 256],
