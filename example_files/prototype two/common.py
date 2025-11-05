@@ -220,6 +220,35 @@ class ConfigManager:
             "labels_csv": "str",
             "label_all": "int",
             "labels": "list[int]",
+            # Newer keys to support multi-source training without CSVs
+            "train_source_labels": "list[int]",
+            "val_source_labels": "list[int]",
+            "source_labels": "list[int]",
+            # Common consolidated-config sections and viewer/inference keys
+            "paths": "dict",
+            "data": "dict",
+            "model": "dict",
+            "training": "dict",
+            "inference": "dict",
+            "viewer": "dict",
+            "outputs_root": "str",
+            "generate_heatmap": "bool",
+            "generate_confusion_matrix": "bool",
+            "show_heatmap": "bool",
+            "heatmap_class": "int",
+            "cm_csv": "str",
+            "cm_png": "str",
+            "heatmaps_dir": "str",
+            "stitched_heatmap": "str",
+            "labels_npy": "str",
+            "class_names": "list[str]",
+            "viewer_values_csv": "str",
+            "viewer_title": "str",
+            "viewer_cmap": "str",
+            "viewer_no_show": "bool",
+            "viewer_save": "str",
+            "viewer_rows": "int",
+            "viewer_cols": "int",
         }
         for k in list(config.keys()):
             if k not in expected:
@@ -238,7 +267,7 @@ class ConfigManager:
         config.setdefault("weight_decay", 0.0)
         config.setdefault("tile_size", [256, 256])
 
-        # Resolve paths relative to the config file
+        # Resolve paths relative to the config file (support str and list[str])
         for key in ("field_path", "train_field_path", "test_field_path", "save_weights"):
             fp = config.get(key, "")
             if isinstance(fp, str) and fp.strip():
@@ -246,6 +275,16 @@ class ConfigManager:
                 if not p.is_absolute():
                     p = (self.path.parent / p).resolve()
                     config[key] = str(p)
+            elif isinstance(fp, (list, tuple)):
+                resolved_list = []
+                for item in fp:
+                    if isinstance(item, str) and item.strip():
+                        q = Path(item)
+                        if not q.is_absolute():
+                            q = (self.path.parent / q).resolve()
+                        resolved_list.append(str(q))
+                if resolved_list:
+                    config[key] = resolved_list
 
         # Basic validation
         ts = config.get("tile_size", [256, 256])
@@ -493,5 +532,3 @@ class PathResolver:
         except Exception:
             pass
         return None
-
-

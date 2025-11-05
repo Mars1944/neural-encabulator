@@ -1,0 +1,4 @@
+file_name,predicted_class,predicted_index,confidence_percent
+laminar sparse_flow_vectors.csv,turbulent,1,99.98
+laminar sparse_flow_vectors.csv,laminar,1,99.98
+laminar sparse_flow_vectors.csv,laminar,1,99.98

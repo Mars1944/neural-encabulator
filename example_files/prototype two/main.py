@@ -2,7 +2,7 @@ import argparse
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from datetime import datetime
 
 # Centralized optional imports
@@ -32,17 +32,28 @@ from vector_field_data import (
 class ModelManager:
     """Builds the model and optimizer and provides input loading helpers."""
 
-    def __init__(self, config: Dict[str, Any], device: str) -> None:
+    def __init__(self, config: Dict[str, Any], device: "torch.device") -> None:
         self.config = config
         self.device = device
         self.model = self._build_model()
 
+    def _select_path(self, value: Any) -> str:
+        """Pick a single file path from config entry that may be str or list[str]."""
+        if isinstance(value, (list, tuple)):
+            for v in value:
+                if isinstance(v, str) and v.strip():
+                    return v
+            return ""
+        return str(value or "")
+
     def _build_model(self) -> "torch.nn.Module":
         # Infer channels from vector-field file if provided
-        field_path = str(self.config.get("field_path", "") or "")
+        field_path = self._select_path(self.config.get("field_path", ""))
         if not field_path.strip():
             use_test = bool(self.config.get("use_test", False))
-            field_path = str(self.config.get("test_field_path" if use_test else "train_field_path", "") or "")
+            field_path = self._select_path(
+                self.config.get("test_field_path" if use_test else "train_field_path", "")
+            )
         if isinstance(field_path, str) and field_path.strip():
             src = (
                 "config.field_path"
@@ -71,22 +82,22 @@ class ModelManager:
         h, w = tuple(self.config.get("tile_size", [256, 256]))
         return torch.randn(b, c, int(h), int(w), device=self.device)
 
-    def load_inputs(self, field_path: str | None = None) -> "torch.Tensor":
+    def load_inputs(self, field_path: Optional[str] = None) -> "torch.Tensor":
         # CLI arg overrides config
-        use_field: str | None = None
+        use_field: Optional[str] = None
         src = ""
         if isinstance(field_path, str) and field_path.strip():
             use_field = field_path
             src = "arg.field_path"
         else:
-            config_field_path = str(self.config.get("field_path", "") or "")
+            config_field_path = self._select_path(self.config.get("field_path", ""))
             if config_field_path.strip():
                 use_field = config_field_path
                 src = "config.field_path"
             else:
                 use_test = bool(self.config.get("use_test", False))
                 key = "test_field_path" if use_test else "train_field_path"
-                use_field = str(self.config.get(key, "") or "")
+                use_field = self._select_path(self.config.get(key, "") or "")
                 src = f"config.{key}"
         if isinstance(use_field, str) and use_field.strip():
             print(f"Using vector field: {use_field} [source={src}]")

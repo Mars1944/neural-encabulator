@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Tuple, List
 
 import numpy as np
 import torch
 
-from vector_field_data import ensure_chw, load_vector_field, load_vector_field_tiles
+from vector_field_data import (
+    ensure_chw,
+    load_vector_field,
+    load_vector_field_tiles,
+    load_vector_field_tiles_with_labels,
+)
 from common import load_labels_from_csv
 
 
@@ -86,31 +91,160 @@ class Trainer:
         self.device = device
         self.model = model.to(device)
         self.criterion = torch.nn.CrossEntropyLoss()
+        # When True, _load_split will reuse tile_size/tile_stride from config without recomputing
+        self._tiling_locked: bool = False
         from cnn_optim import CnnOptim
 
         self.optim_builder = CnnOptim(self.config)
         self.optimizer, self.scheduler, self.scheduler_step_on = self.optim_builder.build(self.model)
 
     def _load_split(self, *, field_path: str, split: str) -> Tuple[np.ndarray, np.ndarray]:
-        tile_size = tuple(self.config.get("tile_size", [256, 256]))
+        """
+        Load tiles and labels for a split. Supports:
+        - Single CSV/path (string)
+        - Multiple paths provided as list in config, or as a string separated by ';' or ','
+        Uses embedded label column if present (via load_vector_field_tiles_with_labels),
+        otherwise falls back to config-provided labels.
+        """
+        tile_size_cfg = tuple(self.config.get("tile_size", [256, 256]))
         stride_cfg = self.config.get("tile_stride", None)
-        stride: Tuple[int, int] | None = None
+        stride_cfg_tuple: Tuple[int, int] | None = None
         if isinstance(stride_cfg, (list, tuple)):
-            stride = (int(stride_cfg[0]), int(stride_cfg[1]))
+            stride_cfg_tuple = (int(stride_cfg[0]), int(stride_cfg[1]))
         add_mag = bool(self.config.get("add_magnitude", True))
         normalize = bool(self.config.get("normalize", True))
         limit_tiles = self.config.get("limit_tiles", None)
 
-        x_np = load_vector_field_tiles(
-            path=field_path,
-            tile_size=(int(tile_size[0]), int(tile_size[1])),
-            stride=stride,
-            add_magnitude=add_mag,
-            normalize=normalize,
-            limit_tiles=None if limit_tiles is None else int(limit_tiles),
-        )
-        y_np = _prepare_labels(n=x_np.shape[0], config=self.config, split=split)
-        return x_np, y_np
+        paths: List[str] = []
+        if isinstance(field_path, str):
+            s = field_path.strip()
+            if ";" in s or "," in s:
+                for part in s.replace(";", ",").split(","):
+                    if part.strip():
+                        paths.append(part.strip())
+            else:
+                paths.append(s)
+        else:
+            # Should not happen given signature, but keep robust
+            try:
+                paths = list(field_path)  # type: ignore[arg-type]
+            except Exception:
+                raise RuntimeError("field_path must be a string or list of strings")
+
+        # Anchor all paths relative to config dir
+        base_dir = Path(self.config.get("_config_dir", "."))
+        abs_paths: List[Path] = []
+        for p in paths:
+            pp = Path(p)
+            if not pp.is_absolute():
+                pp = (base_dir / pp).resolve()
+            abs_paths.append(pp)
+
+        # Determine tiling to use
+        if getattr(self, "_tiling_locked", False):
+            # Reuse precomputed tiling from config
+            safe_th, safe_tw = int(tile_size_cfg[0]), int(tile_size_cfg[1])
+            if stride_cfg_tuple is None:
+                safe_stride = (safe_th, safe_tw)
+            else:
+                sh, sw = int(stride_cfg_tuple[0]), int(stride_cfg_tuple[1])
+                safe_stride = (max(1, min(sh, safe_th)), max(1, min(sw, safe_tw)))
+        else:
+            # Compute a safe tiling across these inputs and persist to config
+            min_H, min_W = None, None
+            for pp in abs_paths:
+                try:
+                    arr = load_vector_field(str(pp))
+                    chw = ensure_chw(arr)
+                    H, W = int(chw.shape[1]), int(chw.shape[2])
+                    min_H = H if min_H is None else min(min_H, H)
+                    min_W = W if min_W is None else min(min_W, W)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to inspect field size for '{pp}': {e}")
+
+            desired_th, desired_tw = int(tile_size_cfg[0]), int(tile_size_cfg[1])
+            safe_th = max(1, min(desired_th, int(min_H or desired_th)))
+            safe_tw = max(1, min(desired_tw, int(min_W or desired_tw)))
+            if stride_cfg_tuple is None:
+                safe_stride = (safe_th, safe_tw)
+            else:
+                sh, sw = int(stride_cfg_tuple[0]), int(stride_cfg_tuple[1])
+                safe_stride = (max(1, min(sh, safe_th)), max(1, min(sw, safe_tw)))
+
+            self.config["tile_size"] = [int(safe_th), int(safe_tw)]
+            self.config["tile_stride"] = [int(safe_stride[0]), int(safe_stride[1])]
+            print(
+                f"[tiling] Using tile_size=({safe_th},{safe_tw}) stride=({safe_stride[0]},{safe_stride[1]}) across {len(abs_paths)} source(s)"
+            )
+
+        # Prepare accumulation lists
+        X_list: List[np.ndarray] = []
+        y_list: List[np.ndarray] = []
+
+        # Optional: per-source labels from config (e.g., train_source_labels / val_source_labels / source_labels)
+        src_labels_key = f"{split}_source_labels"
+        src_labels = self.config.get(src_labels_key, None)
+        if src_labels is None:
+            src_labels = self.config.get("source_labels", None)
+        if isinstance(src_labels, (list, tuple)) and len(src_labels) != len(paths):
+            print(
+                f"[warn] {src_labels_key if f'{split}_source_labels' in self.config else 'source_labels'} length {len(src_labels)} doesn't match number of paths {len(paths)}; ignoring"
+            )
+            src_labels = None
+
+        for idx_p, pp in enumerate(abs_paths):
+            used_limit = None if limit_tiles is None else int(max(0, limit_tiles - sum(x.shape[0] for x in X_list)))
+            if isinstance(src_labels, (list, tuple)):
+                # Use uniform label per source based on config list
+                Xp = load_vector_field_tiles(
+                    path=str(pp),
+                    tile_size=(int(safe_th), int(safe_tw)),
+                    stride=(int(safe_stride[0]), int(safe_stride[1])),
+                    add_magnitude=add_mag,
+                    normalize=normalize,
+                    limit_tiles=used_limit,
+                )
+                lbl = int(src_labels[idx_p])
+                yp = np.full((Xp.shape[0],), lbl, dtype=np.int64)
+            else:
+                # Prefer embedded labels when available
+                try:
+                    Xp, yp = load_vector_field_tiles_with_labels(
+                        path=str(pp),
+                        tile_size=(int(safe_th), int(safe_tw)),
+                        stride=(int(safe_stride[0]), int(safe_stride[1])),
+                        add_magnitude=add_mag,
+                        normalize=normalize,
+                        limit_tiles=used_limit,
+                        label_aggregation="majority",
+                        drop_unlabeled=True,
+                    )
+                except Exception:
+                    # Fallback: no embedded labels; use legacy path
+                    Xp = load_vector_field_tiles(
+                        path=str(pp),
+                        tile_size=(int(safe_th), int(safe_tw)),
+                        stride=(int(safe_stride[0]), int(safe_stride[1])),
+                        add_magnitude=add_mag,
+                        normalize=normalize,
+                        limit_tiles=used_limit,
+                    )
+                    yp = _prepare_labels(n=Xp.shape[0], config=self.config, split=split)
+            X_list.append(Xp)
+            y_list.append(yp)
+            if limit_tiles is not None and sum(x.shape[0] for x in X_list) >= int(limit_tiles):
+                break
+
+        if not X_list:
+            raise RuntimeError("No tiles produced for split; check paths/tile_size/stride")
+        X = np.concatenate(X_list, axis=0)
+        y = np.concatenate(y_list, axis=0)
+
+        # Normalize labels to 0..num_classes-1 when labels are 1/2-based and num_classes=2
+        if y.size > 0:
+            if y.min() >= 1 and y.max() <= 2 and int(self.config.get("num_classes", 2)) == 2:
+                y = (y - 1).astype(np.int64)
+        return X, y
 
     def _train_one_epoch(self, loader: torch.utils.data.DataLoader, epoch: int) -> Tuple[float, float]:
         self.model.train()
@@ -155,10 +289,69 @@ class Trainer:
 
     def fit(self) -> Path:
         # Resolve training/validation fields
-        train_field = str(self.config.get("train_field_path", self.config.get("field_path", "")) or "")
+        train_field_cfg = self.config.get("train_field_path", self.config.get("field_path", ""))
+        # Allow list of paths or delimited string
+        if isinstance(train_field_cfg, (list, tuple)):
+            train_field = ";".join([str(p) for p in train_field_cfg])
+            train_list = [str(p) for p in train_field_cfg]
+        else:
+            train_field = str(train_field_cfg or "")
+            if ";" in train_field or "," in train_field:
+                train_list = [s.strip() for s in train_field.replace(";", ",").split(",") if s.strip()]
+            else:
+                train_list = [train_field] if train_field else []
         if not train_field:
             raise RuntimeError("'train_field_path' or 'field_path' is required for training")
-        val_field = str(self.config.get("test_field_path", "") or "")
+        val_cfg = self.config.get("test_field_path", "")
+        if isinstance(val_cfg, (list, tuple)):
+            val_field = ";".join([str(p) for p in val_cfg])
+            val_list = [str(p) for p in val_cfg]
+        else:
+            val_field = str(val_cfg or "")
+            if ";" in val_field or "," in val_field:
+                val_list = [s.strip() for s in val_field.replace(";", ",").split(",") if s.strip()]
+            else:
+                val_list = [val_field] if val_field else []
+
+        # Compute single global tiling across train+val and lock it
+        base_dir = Path(self.config.get("_config_dir", "."))
+        inspect_paths: List[Path] = []
+        for s in train_list + val_list:
+            if not s:
+                continue
+            p = Path(s)
+            if not p.is_absolute():
+                p = (base_dir / p).resolve()
+            inspect_paths.append(p)
+        if inspect_paths:
+            min_H, min_W = None, None
+            for p in inspect_paths:
+                try:
+                    arr = load_vector_field(str(p))
+                    chw = ensure_chw(arr)
+                    H, W = int(chw.shape[1]), int(chw.shape[2])
+                    min_H = H if min_H is None else min(min_H, H)
+                    min_W = W if min_W is None else min(min_W, W)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to inspect field size for '{p}': {e}")
+
+            desired_th, desired_tw = tuple(self.config.get("tile_size", [256, 256]))
+            stride_cfg = self.config.get("tile_stride", None)
+            if isinstance(stride_cfg, (list, tuple)):
+                sh, sw = int(stride_cfg[0]), int(stride_cfg[1])
+            else:
+                sh, sw = int(desired_th), int(desired_tw)
+            safe_th = max(1, min(int(desired_th), int(min_H or desired_th)))
+            safe_tw = max(1, min(int(desired_tw), int(min_W or desired_tw)))
+            safe_sh = max(1, min(int(sh), safe_th))
+            safe_sw = max(1, min(int(sw), safe_tw))
+
+            self.config["tile_size"] = [int(safe_th), int(safe_tw)]
+            self.config["tile_stride"] = [int(safe_sh), int(safe_sw)]
+            self._tiling_locked = True
+            print(
+                f"[tiling] Global tile_size=({safe_th},{safe_tw}) stride=({safe_sh},{safe_sw}) across {len(inspect_paths)} source(s)"
+            )
 
         # Load tiles + labels
         x_train, y_train = self._load_split(field_path=train_field, split="train")
