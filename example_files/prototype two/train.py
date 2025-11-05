@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 
 from common import ConfigManager
+from console import console_from_config
 from main import ModelManager
 from trainer import Trainer
 
@@ -26,7 +27,8 @@ def main() -> None:
     manager = ModelManager(cfg_mgr.config, cfg_mgr.device)
     trainer = Trainer(cfg_mgr.config, cfg_mgr.device, manager.model)
     best_path = trainer.fit()
-    print(f"Training complete. Best/Final checkpoint: {best_path}")
+    c = console_from_config(cfg_mgr.config)
+    c.success(f"Training complete. Best/Final checkpoint: {best_path}")
 
 
 if __name__ == "__main__":

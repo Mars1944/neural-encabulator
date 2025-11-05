@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Tuple
+from console import console_from_config
 
 import torch
 
@@ -47,7 +48,7 @@ class CnnOptim:
             betas = self.config.get("betas", (0.9, 0.999))
             optimizer = torch.optim.AdamW(params, lr=lr, betas=tuple(betas), weight_decay=wd, eps=eps)
 
-        print(f"Optimizer: {optimizer.__class__.__name__} (lr={lr}, weight_decay={wd})")
+        console_from_config(self.config).info(f"Optimizer: {optimizer.__class__.__name__} (lr={lr}, weight_decay={wd})")
         return optimizer
 
     def build_scheduler(
@@ -61,14 +62,14 @@ class CnnOptim:
             t_max = int(self.config.get("t_max", self.config.get("max_epochs", 50)))
             eta_min = float(self.config.get("eta_min", 0.0))
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
-            print(f"Scheduler: CosineAnnealingLR (T_max={t_max}, eta_min={eta_min}) [epoch]")
+            console_from_config(self.config).info(f"Scheduler: CosineAnnealingLR (T_max={t_max}, eta_min={eta_min}) [epoch]")
             return scheduler, "epoch"
 
         if name == "step":
             step_size = int(self.config.get("step_size", 30))
             gamma = float(self.config.get("gamma", 0.1))
             scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
-            print(f"Scheduler: StepLR (step_size={step_size}, gamma={gamma}) [epoch]")
+            console_from_config(self.config).info(f"Scheduler: StepLR (step_size={step_size}, gamma={gamma}) [epoch]")
             return scheduler, "epoch"
 
         if name == "plateau":
@@ -84,7 +85,7 @@ class CnnOptim:
                 min_lr=min_lr,
                 cooldown=cooldown,
             )
-            print(
+            console_from_config(self.config).info(
                 f"Scheduler: ReduceLROnPlateau (patience={patience}, factor={factor}, min_lr={min_lr}, cooldown={cooldown}) [epoch]"
             )
             return scheduler, "epoch"
@@ -101,14 +102,14 @@ class CnnOptim:
 
             warm = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
             cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
-            print(
+            console_from_config(self.config).info(
                 f"Scheduler: Warmup({warmup_epochs}) + CosineAnnealingLR (T_max={max_epochs}) [epoch]"
             )
             setattr(optimizer, "_warmup_scheduler", warm)
             setattr(optimizer, "_warmup_epochs", warmup_epochs)
             return cosine, "epoch"
 
-        print(f"[warn] Unknown scheduler '{name}'; no scheduler will be used.")
+        console_from_config(self.config).warn(f"Unknown scheduler '{name}'; no scheduler will be used.")
         return None, "epoch"
 
     def build(

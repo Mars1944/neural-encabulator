@@ -12,7 +12,8 @@ from vector_field_data import (
     load_vector_field_tiles,
     load_vector_field_tiles_with_labels,
 )
-from common import load_labels_from_csv
+from common import load_labels_from_csv, parse_field_paths
+from console import console_from_config
 
 
 def _prepare_labels(
@@ -91,6 +92,7 @@ class Trainer:
         self.device = device
         self.model = model.to(device)
         self.criterion = torch.nn.CrossEntropyLoss()
+        self.console = console_from_config(self.config)
         # When True, _load_split will reuse tile_size/tile_stride from config without recomputing
         self._tiling_locked: bool = False
         from cnn_optim import CnnOptim
@@ -115,21 +117,9 @@ class Trainer:
         normalize = bool(self.config.get("normalize", True))
         limit_tiles = self.config.get("limit_tiles", None)
 
-        paths: List[str] = []
-        if isinstance(field_path, str):
-            s = field_path.strip()
-            if ";" in s or "," in s:
-                for part in s.replace(";", ",").split(","):
-                    if part.strip():
-                        paths.append(part.strip())
-            else:
-                paths.append(s)
-        else:
-            # Should not happen given signature, but keep robust
-            try:
-                paths = list(field_path)  # type: ignore[arg-type]
-            except Exception:
-                raise RuntimeError("field_path must be a string or list of strings")
+        paths: List[str] = parse_field_paths(field_path)
+        if not paths:
+            raise RuntimeError("field_path must be a non-empty string or list of strings")
 
         # Anchor all paths relative to config dir
         base_dir = Path(self.config.get("_config_dir", "."))
@@ -173,7 +163,7 @@ class Trainer:
 
             self.config["tile_size"] = [int(safe_th), int(safe_tw)]
             self.config["tile_stride"] = [int(safe_stride[0]), int(safe_stride[1])]
-            print(
+            self.console.info(
                 f"[tiling] Using tile_size=({safe_th},{safe_tw}) stride=({safe_stride[0]},{safe_stride[1]}) across {len(abs_paths)} source(s)"
             )
 
@@ -187,8 +177,8 @@ class Trainer:
         if src_labels is None:
             src_labels = self.config.get("source_labels", None)
         if isinstance(src_labels, (list, tuple)) and len(src_labels) != len(paths):
-            print(
-                f"[warn] {src_labels_key if f'{split}_source_labels' in self.config else 'source_labels'} length {len(src_labels)} doesn't match number of paths {len(paths)}; ignoring"
+            self.console.warn(
+                f"{src_labels_key if f'{split}_source_labels' in self.config else 'source_labels'} length {len(src_labels)} doesn't match number of paths {len(paths)}; ignoring"
             )
             src_labels = None
 
@@ -349,7 +339,7 @@ class Trainer:
             self.config["tile_size"] = [int(safe_th), int(safe_tw)]
             self.config["tile_stride"] = [int(safe_sh), int(safe_sw)]
             self._tiling_locked = True
-            print(
+            self.console.info(
                 f"[tiling] Global tile_size=({safe_th},{safe_tw}) stride=({safe_sh},{safe_sw}) across {len(inspect_paths)} source(s)"
             )
 
@@ -363,7 +353,7 @@ class Trainer:
                 x_val, y_val = self._load_split(field_path=val_field, split="val")
                 use_holdout = True
             except Exception as e:
-                print(f"[warn] Validation field specified but labels missing or invalid: {e}. Falling back to split.")
+                self.console.warn(f"Validation field specified but labels missing or invalid: {e}. Falling back to split.")
                 use_holdout = False
 
         if not use_holdout:
@@ -399,7 +389,7 @@ class Trainer:
         for epoch in range(1, max_epochs + 1):
             tr_loss, tr_acc = self._train_one_epoch(train_loader, epoch)
             va_loss, va_acc = self._eval(val_loader)
-            print(
+            self.console.info(
                 f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f}"
             )
 
@@ -452,5 +442,5 @@ class Trainer:
             "optimizer_state": self.optimizer.state_dict(),
         }
         torch.save(checkpoint, str(path))
-        print(f"Saved checkpoint: {path}")
+        self.console.success(f"Saved checkpoint: {path}")
         return path

@@ -12,53 +12,24 @@ _sys.path.append(str(Path(__file__).parent))
 
 from cnn_model import SimpleCNN
 from vector_field_data import ensure_chw, load_vector_field, load_vector_field_tiles, load_vector_field_tiles_with_labels
-from common import DeviceSelector, infer_input_channels_from_field, load_labels_from_csv, PathResolver
+from common import (
+    DeviceSelector,
+    infer_input_channels_from_field,
+    load_labels_from_csv,
+    PathResolver,
+    ConfigManager,
+    parse_field_paths,
+    choose_fields,
+    write_labels_template,
+    save_confusion_outputs,
+)
 from common import HeatmapGenerator
 from heatmap_viewer import show_stitched_heatmap
     # labels loader available in common.load_labels_from_csv
+from console import console_from_config
 
 
-def load_config(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        config = json.load(f)
-    # Merge nested sections onto top-level without overwriting explicit top-level keys
-    for sec in ("paths", "data", "model", "training", "inference", "viewer"):
-        sec_dict = config.get(sec, None)
-        if isinstance(sec_dict, dict):
-            for k, v in sec_dict.items():
-                if k not in config:
-                    config[k] = v
-    # Resolve path-like keys relative to config directory; support str or list[str]
-    def _anchor_one(p: str) -> str:
-        q = Path(p)
-        return str(q if q.is_absolute() else (path.parent / q).resolve())
-
-    for key in ("field_path", "train_field_path", "test_field_path", "save_weights"):
-        fp = config.get(key, None)
-        if isinstance(fp, str) and fp.strip():
-            config[key] = _anchor_one(fp)
-        elif isinstance(fp, (list, tuple)):
-            anchored: list[str] = []
-            for item in fp:
-                if isinstance(item, str) and item.strip():
-                    anchored.append(_anchor_one(item))
-            if anchored:
-                config[key] = anchored
-
-    # If field_path is not set, derive from train/test based on use_test flag
-    use_test = bool(config.get("use_test", config.get("inference_use_test", False)))
-    if not (isinstance(config.get("field_path", None), str) and str(config.get("field_path")).strip()):
-        key = "test_field_path" if use_test else "train_field_path"
-        fp = config.get(key, None)
-        if isinstance(fp, (list, tuple)) and fp:
-            config["field_path"] = str(fp[0])
-        elif isinstance(fp, str) and fp.strip():
-            config["field_path"] = str(fp)
-    return config
-
-
-def choose_device(pref: str | None) -> torch.device:
-    return DeviceSelector.choose(pref)
+## Config loading and device selection are consolidated in common.ConfigManager and DeviceSelector
 
 
     # Note: prefer common.infer_input_channels_from_field in new code
@@ -119,7 +90,8 @@ def run_inference(
     cm_png_out: Path | None = None,
     show_heatmap: bool = False,
     file_summary_out: Path | None = None,
-) -> None:
+) -> "np.ndarray | None":
+    c = console_from_config(config)
     tile_size = tuple(config.get("tile_size", [256, 256]))
     stride_cfg = config.get("tile_stride", None)
     stride: Tuple[int, int] | None = None
@@ -129,15 +101,47 @@ def run_inference(
     normalize = bool(config.get("normalize", True))
     limit_tiles = config.get("limit_tiles", None)
 
-    tile_batch = load_vector_field_tiles(
-        path=field_path,
-        tile_size=(int(tile_size[0]), int(tile_size[1])),
-        stride=stride,
-        add_magnitude=add_mag,
-        normalize=normalize,
-        limit_tiles=None if limit_tiles is None else int(limit_tiles),
-    )
-    print(f"Loaded tiles: shape={tile_batch.shape}")
+    try:
+        tile_batch = load_vector_field_tiles(
+            path=field_path,
+            tile_size=(int(tile_size[0]), int(tile_size[1])),
+            stride=stride,
+            add_magnitude=add_mag,
+            normalize=normalize,
+            limit_tiles=None if limit_tiles is None else int(limit_tiles),
+        )
+    except Exception as e:
+        msg = str(e)
+        # Fallback: if no tiles produced (field smaller than configured tile), auto-adjust to safe tiling
+        if "No tiles produced" in msg or "check tile_size/stride" in msg:
+            try:
+                field_arr = load_vector_field(field_path, mmap=True)
+                chw = ensure_chw(field_arr)
+                H, W = int(chw.shape[1]), int(chw.shape[2])
+                safe_th = max(1, min(int(tile_size[0]), H))
+                safe_tw = max(1, min(int(tile_size[1]), W))
+                if isinstance(stride, tuple):
+                    sh, sw = int(stride[0]), int(stride[1])
+                else:
+                    sh, sw = int(tile_size[0]), int(tile_size[1])
+                safe_sh = max(1, min(sh, safe_th))
+                safe_sw = max(1, min(sw, safe_tw))
+                c.warn(
+                    f"No tiles with configured tile_size/stride; retrying with safe tile_size=({safe_th},{safe_tw}) stride=({safe_sh},{safe_sw}) for this file"
+                )
+                tile_batch = load_vector_field_tiles(
+                    path=field_path,
+                    tile_size=(safe_th, safe_tw),
+                    stride=(safe_sh, safe_sw),
+                    add_magnitude=add_mag,
+                    normalize=normalize,
+                    limit_tiles=None if limit_tiles is None else int(limit_tiles),
+                )
+            except Exception as e2:
+                raise e2
+        else:
+            raise
+    c.info(f"Loaded tiles: shape={tile_batch.shape}")
 
     model.eval()
     with torch.no_grad():
@@ -147,11 +151,11 @@ def run_inference(
         conf, pred = torch.max(probs, dim=1)
 
     # Summaries
-    print(f"Logits shape: {tuple(logits.shape)} | num_classes={logits.shape[1]}")
+    c.info(f"Logits shape: {tuple(logits.shape)} | num_classes={logits.shape[1]}")
     topk = min(5, logits.shape[0])
-    print("Sample predictions (first N tiles):")
+    c.debug("Sample predictions (first N tiles):")
     for i in range(topk):
-        print(f"  tile[{i:03d}]: class={pred[i].item()} prob={conf[i].item():.4f}")
+        c.debug(f"  tile[{i:03d}]: class={pred[i].item()} prob={conf[i].item():.4f}")
 
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -163,17 +167,17 @@ def run_inference(
             w.writerow(["tile_index", "predicted_class", "confidence"])
             for i in range(pred.shape[0]):
                 w.writerow([i, int(pred[i].item()), float(conf[i].item())])
-        print(f"Saved predictions to: {output}")
+        c.success(f"Saved predictions to: {output}")
 
     # Optional: save full probabilities/logits per tile
     if probs_out is not None:
         probs_out.parent.mkdir(parents=True, exist_ok=True)
         np.save(str(probs_out.with_suffix(".npy")), probs.cpu().numpy())
-        print(f"Saved probabilities (N,C) to: {probs_out.with_suffix('.npy')}")
+        c.success(f"Saved probabilities (N,C) to: {probs_out.with_suffix('.npy')}")
     if logits_out is not None:
         logits_out.parent.mkdir(parents=True, exist_ok=True)
         np.save(str(logits_out.with_suffix(".npy")), logits.cpu().numpy())
-        print(f"Saved logits (N,C) to: {logits_out.with_suffix('.npy')}")
+        c.success(f"Saved logits (N,C) to: {logits_out.with_suffix('.npy')}")
 
     # Optional: heatmaps per tile and stitched heatmap via HeatmapGenerator
     if heatmaps_dir is not None or stitch_heatmap_path is not None or show_heatmap:
@@ -181,7 +185,7 @@ def run_inference(
         if heatmap_class is not None:
             hc = int(heatmap_class)
             if hc < 0 or hc >= probs_cpu.shape[1]:
-                print(f"[warn] heatmap_class {hc} out of range; using predicted class conf")
+                c.warn(f"heatmap_class {hc} out of range; using predicted class conf")
                 vals = conf.cpu().numpy()
             else:
                 vals = probs_cpu[:, hc]
@@ -191,8 +195,14 @@ def run_inference(
         hm = HeatmapGenerator(cmap="viridis")
 
         if heatmaps_dir is not None:
-            hm.save_per_tile(vals, out_dir=heatmaps_dir, tile_img_size=16)
-            print(f"Saved per-tile heatmaps to: {heatmaps_dir}")
+            # Allow configurable per-tile heatmap image size via config (default 16)
+            tile_img_sz = 16
+            try:
+                tile_img_sz = int(config.get("heatmap_tile_size", 16))
+            except Exception:
+                tile_img_sz = 16
+            hm.save_per_tile(vals, out_dir=heatmaps_dir, tile_img_size=tile_img_sz)
+            c.success(f"Saved per-tile heatmaps to: {heatmaps_dir}")
 
         if stitch_heatmap_path is not None or show_heatmap:
             field_array = load_vector_field(field_path, mmap=True)
@@ -222,7 +232,7 @@ def run_inference(
                         cmap="viridis",
                     )
                 else:
-                    print(f"[warn] Cannot show heatmap: grid ({n_rows}x{n_cols}) doesn't match N={vals.shape[0]}")
+                    c.warn(f"Cannot show heatmap: grid ({n_rows}x{n_cols}) doesn't match N={vals.shape[0]}")
             # (Removed duplicate unconditional heatmap display block)
 
     # File-level summary prediction: average probabilities across tiles
@@ -244,13 +254,21 @@ def run_inference(
             try:
                 file_summary_out.parent.mkdir(parents=True, exist_ok=True)
                 import csv
-                write_header = not file_summary_out.exists()
+                write_header = True
+                try:
+                    if file_summary_out.exists():
+                        # If file exists but is empty, still write header
+                        write_header = file_summary_out.stat().st_size == 0
+                    else:
+                        write_header = True
+                except Exception:
+                    write_header = True
                 with file_summary_out.open("a", newline="", encoding="utf-8") as f:
                     w = csv.writer(f)
                     if write_header:
                         w.writerow(["file_name", "predicted_class", "predicted_index", "confidence_percent"]) 
                     w.writerow([fname, pred_name, file_pred_idx, round(file_conf * 100.0, 2)])
-                print(f"Appended file summary for {fname} -> {pred_name} ({file_conf*100.0:.2f}%) to {file_summary_out}")
+                c.success(f"Appended file summary for {fname} -> {pred_name} ({file_conf*100.0:.2f}%) to {file_summary_out}")
             except Exception as e:
                 # Fallback: write to a timestamped file if the target is locked (e.g., open in Excel)
                 try:
@@ -263,15 +281,13 @@ def run_inference(
                         w = csv.writer(f)
                         w.writerow(["file_name", "predicted_class", "predicted_index", "confidence_percent"]) 
                         w.writerow([fname, pred_name, file_pred_idx, round(file_conf * 100.0, 2)])
-                    print(
-                        f"[info] Summary file locked ('{file_summary_out}'); wrote to '{alt}' instead."
-                    )
+                    c.info(f"Summary file locked ('{file_summary_out}'); wrote to '{alt}' instead.")
                 except Exception as e2:
-                    print(f"[warn] Failed to write file summary (fallback also failed): {e2}")
+                    c.warn(f"Failed to write file summary (fallback also failed): {e2}")
         else:
-            print(f"File-level prediction for {fname}: {pred_name} ({file_conf*100.0:.2f}%)")
+            c.info(f"File-level prediction for {fname}: {pred_name} ({file_conf*100.0:.2f}%)")
     except Exception as e:
-        print(f"[warn] Failed to compute file-level summary: {e}")
+        c.warn(f"Failed to compute file-level summary: {e}")
 
     # Optional: confusion matrix
     # Resolve labels precedence: labels_array > labels_csv > label_all > config keys
@@ -285,7 +301,7 @@ def run_inference(
         try:
             y_true = load_labels_from_csv(labels_csv)
         except Exception as e:
-            print(f"[warn] Failed to load labels_csv '{labels_csv}': {e}")
+            c.warn(f"Failed to load labels_csv '{labels_csv}': {e}")
     if y_true is None and label_all is not None:
         y_true = np.full((tile_batch.shape[0],), int(label_all), dtype=np.int64)
     if y_true is None:
@@ -294,7 +310,7 @@ def run_inference(
             try:
                 y_true = load_labels_from_csv(Path(cfg_csv))
             except Exception as e:
-                print(f"[warn] Failed to load config.labels_csv '{cfg_csv}': {e}")
+                c.warn(f"Failed to load config.labels_csv '{cfg_csv}': {e}")
         if y_true is None and config.get("label_all", None) is not None:
             try:
                 y_true = np.full((tile_batch.shape[0],), int(config.get("label_all")), dtype=np.int64)
@@ -326,11 +342,9 @@ def run_inference(
                 if y_emb.shape[0] == int(tile_batch.shape[0]):
                     y_true = y_emb.astype(np.int64)
                 else:
-                    print(
-                        f"[warn] Embedded labels length {y_emb.shape[0]} doesn't match tiles {tile_batch.shape[0]}; skipping embedded labels"
-                    )
+                    c.warn(f"Embedded labels length {y_emb.shape[0]} doesn't match tiles {tile_batch.shape[0]}; skipping embedded labels")
         except Exception as e:
-            print(f"[warn] Failed to derive embedded labels from CSV: {e}")
+            c.warn(f"Failed to derive embedded labels from CSV: {e}")
 
     # If still missing labels and CM is requested, optionally auto-dump a labels template CSV
     if (cm_csv_out is not None or cm_png_out is not None) and y_true is None:
@@ -340,33 +354,23 @@ def run_inference(
                 stem = Path(field_path).stem
                 base_dir = cm_csv_out.parent if cm_csv_out is not None else (cm_png_out.parent if cm_png_out is not None else Path("."))
                 tmpl_path = base_dir / f"labels_template-{stem}.csv"
-                tmpl_path.parent.mkdir(parents=True, exist_ok=True)
-                import csv
-
-                # Provide a helper template with predicted_class for convenience
-                with tmpl_path.open("w", newline="", encoding="utf-8") as f:
-                    w = csv.writer(f)
-                    w.writerow(["tile_index", "label", "predicted_class"])  # fill label with 0..C-1
-                    for i in range(int(pred.shape[0])):
-                        w.writerow([i, -1, int(pred[i].item())])
-                print(
-                    f"[info] No labels provided; wrote labels template to: {tmpl_path}. Fill the 'label' column and pass via --labels-csv."
-                )
+                write_labels_template(tmpl_path, int(pred.shape[0]), pred.cpu().numpy())
+                c.info(f"No labels provided; wrote labels template to: {tmpl_path}. Fill the 'label' column and pass via --labels-csv.")
             except Exception as e:
-                print(f"[warn] Failed to write labels template CSV: {e}")
+                c.warn(f"Failed to write labels template CSV: {e}")
 
     if (cm_csv_out is not None or cm_png_out is not None) and y_true is not None:
         cm_debug = bool(config.get("cm_debug", False))
         y_pred = pred.cpu().numpy().astype(np.int64)
         n = tile_batch.shape[0]
         if y_true.shape[0] != n:
-            print(f"[warn] Labels length {y_true.shape[0]} does not match tiles {n}; skipping CM")
+            c.warn(f"Labels length {y_true.shape[0]} does not match tiles {n}; skipping CM")
         else:
             # Mask out unlabeled entries (-1 or <0)
             if cm_debug:
                 try:
                     uniq, cnt = np.unique(y_true, return_counts=True)
-                    print(f"[cm_debug] y_true unique raw: {list(zip(uniq.tolist(), cnt.tolist()))}")
+                    c.debug(f"[cm_debug] y_true unique raw: {list(zip(uniq.tolist(), cnt.tolist()))}")
                 except Exception:
                     pass
             mask = y_true >= 0
@@ -389,146 +393,265 @@ def run_inference(
                     y_pred_masked = y_pred_masked[keep]
 
             if cm_debug:
-                print(f"[cm_debug] kept after mask: {int(y_true_masked.size)} of {int(n)}")
+                c.debug(f"[cm_debug] kept after mask: {int(y_true_masked.size)} of {int(n)}")
             if y_true_masked.size == 0:
-                print("[warn] No valid ground-truth labels available for confusion matrix; skipping")
+                c.warn("No valid ground-truth labels available for confusion matrix; skipping")
                 cm = np.zeros((num_classes, num_classes), dtype=np.int64)
             else:
                 idx = (y_true_masked * num_classes + y_pred_masked).astype(np.int64)
                 cm = np.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
 
-            # Save CSV counts
-            if cm_csv_out is not None:
-                try:
-                    cm_csv_out.parent.mkdir(parents=True, exist_ok=True)
-                    import csv
-
-                    with cm_csv_out.open("w", newline="", encoding="utf-8") as f:
-                        w = csv.writer(f)
-                        w.writerow(["true\\pred"] + [f"{j}" for j in range(num_classes)])
-                        for i in range(num_classes):
-                            w.writerow([f"{i}"] + [int(cm[i, j]) for j in range(num_classes)])
-                    print(f"Saved confusion matrix CSV to: {cm_csv_out}")
-                except Exception as e:
-                    print(f"[warn] Failed to save cm_csv: {e}")
+            # Save CSV/PNG/TXT via common helper
+            save_confusion_outputs(cm, class_names, cm_csv_out, cm_png_out, console=c)
 
             # Print simple tile-level accuracy if any labels present
             total = int(cm.sum())
             correct = int(np.trace(cm)) if cm.size > 0 else 0
             if total > 0:
                 acc = correct / total
-                print(f"Tile accuracy: {acc*100.0:.2f}% ({correct}/{total})")
+                c.info(f"Tile accuracy: {acc*100.0:.2f}% ({correct}/{total})")
 
-            # Save WEKA-style text confusion matrix
-            try:
-                # Decide path: prefer alongside cm_csv_out, else alongside cm_png_out
-                weka_txt_out = None
-                if cm_csv_out is not None:
-                    weka_txt_out = cm_csv_out.with_suffix(".txt")
-                elif cm_png_out is not None:
-                    weka_txt_out = cm_png_out.with_suffix(".txt")
-                if weka_txt_out is not None:
-                    weka_txt_out.parent.mkdir(parents=True, exist_ok=True)
-
-                    # Build class label names
-                    labels = (
-                        class_names if (class_names and len(class_names) == num_classes) else [f"class{i}" for i in range(num_classes)]
-                    )
-
-                    # Letter codes: a, b, ..., z, aa, ab, ...
-                    def code(k: int) -> str:
-                        s = ""
-                        k0 = k
-                        while True:
-                            s = chr(ord('a') + (k % 26)) + s
-                            k //= 26
-                            if k == 0:
-                                break
-                            k -= 1
-                        return s
-
-                    # Column width based on max count
-                    max_count = int(cm.max()) if cm.size > 0 else 0
-                    cell_w = max(3, len(str(max_count)))
-
-                    lines = []
-                    lines.append("=== Confusion Matrix ===")
-                    # Header row with letter codes
-                    header = "  " + " ".join(code(j).rjust(cell_w) for j in range(num_classes)) + "   <-- classified as"
-                    lines.append(header)
-                    for i in range(num_classes):
-                        row_counts = " ".join(str(int(cm[i, j])).rjust(cell_w) for j in range(num_classes))
-                        lines.append(f" {row_counts} | {code(i)} = {labels[i]}")
-
-                    with weka_txt_out.open("w", encoding="utf-8") as f:
-                        f.write("\n".join(lines) + "\n")
-                    print(f"Saved WEKA-style CM to: {weka_txt_out}")
-            except Exception as e:
-                print(f"[warn] Failed to save WEKA-style CM: {e}")
-
-            # Save PNG normalized per-column if matplotlib/PIL available
-            if cm_png_out is not None:
-                try:
-                    col_sums = cm.sum(axis=0, keepdims=True).astype(np.float32)
-                    norm = np.divide(
-                        cm.astype(np.float32),
-                        np.maximum(col_sums, 1.0),
-                        out=np.zeros_like(cm, dtype=np.float32),
-                        where=col_sums > 0,
-                    )
-                    class_labels = (
-                        class_names if (class_names and len(class_names) == num_classes) else [f"{i}" for i in range(num_classes)]
-                    )
-                    try:
-                        import matplotlib.pyplot as plt  # type: ignore
-
-                        plt.figure(figsize=(max(4, num_classes), max(3, num_classes * 0.6)))
-                        im = plt.imshow(norm, vmin=0.0, vmax=1.0, cmap="viridis")
-                        plt.colorbar(im, fraction=0.046, pad=0.04, label="col-normalized")
-                        plt.xticks(range(num_classes), class_labels, rotation=45, ha="right")
-                        plt.yticks(range(num_classes), class_labels)
-                        plt.xlabel("Predicted")
-                        plt.ylabel("True")
-                        plt.title("Confusion Matrix (column-normalized)")
-                        plt.tight_layout()
-                        cm_png_out.parent.mkdir(parents=True, exist_ok=True)
-                        plt.savefig(cm_png_out)
-                        plt.close()
-                        print(f"Saved confusion matrix image to: {cm_png_out}")
-                    except Exception:
-                        from PIL import Image  # type: ignore
-
-                        arr = (np.clip(norm, 0.0, 1.0) * 255.0).astype(np.uint8)
-                        img = Image.fromarray(arr, mode="L").resize(
-                            (num_classes * 32, num_classes * 32), resample=Image.NEAREST
-                        )
-                        cm_png_out.parent.mkdir(parents=True, exist_ok=True)
-                        img.save(cm_png_out)
-                        print(f"Saved confusion matrix image (grayscale) to: {cm_png_out}")
-                except Exception as e:
-                    # Final fallback: save normalized matrix as .npy if image backends fail
-                    try:
-                        cm_png_out.parent.mkdir(parents=True, exist_ok=True)
-                        np.save(str(cm_png_out.with_suffix(".npy")), cm.astype(np.float32))
-                        print(
-                            f"[warn] Could not save CM image; saved counts as NPY: {cm_png_out.with_suffix('.npy')} (error: {e})"
-                        )
-                    except Exception as e2:
-                        print(f"[warn] Failed to save confusion matrix image or NPY: {e2}")
+            return cm
 
 
 class InferenceRunner:
     """
-    High-level, class-based inference runner for prototype two.
-    Keeps CLI thin and supports the same config keys as prototype one.
+    Top-level, class-based inference runner for prototype two.
+    Uses common helpers for config, paths, and saving artifacts.
     """
 
     def __init__(self, cfg_path: Path, device_pref: str = "auto") -> None:
-        self.cfg_path = cfg_path
-        self.config = load_config(cfg_path)
+        cfg_mgr = ConfigManager(cfg_path)
+        self.cfg_path = cfg_mgr.path
+        self.config = cfg_mgr.config
         self.device = DeviceSelector.choose(device_pref)
-        print(f"Loaded config from: {self.cfg_path}")
-        print(f"Using device: {self.device}")
+        self.console = console_from_config(self.config)
+        self.console.info(f"Loaded config from: {self.cfg_path}")
+        self.console.info(f"Using device: {self.device}")
+
+    def run(
+        self,
+        *,
+        weights: str | None,
+        field_path: str | None,
+        output: str | None,
+        probs_out: str | None,
+        logits_out: str | None,
+        heatmaps_dir: str | None,
+        heatmap_class: int | None,
+        stitch_heatmap: str | None,
+        labels_csv: str | None,
+        label_all: int | None,
+        labels_array: "list[int] | np.ndarray | None",
+        class_names: "list[str] | None",
+        cm_csv: str | None,
+        cm_png: str | None,
+        show_heatmap: bool,
+        file_summary: str | None,
+        file_labels: str | None,
+        recurse: bool,
+    ) -> None:
+        cfg = self.config
+        fields = choose_fields(cfg, field_path)
+        if not fields:
+            raise RuntimeError("field_path or test/train_field_path must be provided via CLI or config")
+
+        resolver = PathResolver(self.cfg_path, outputs_root=str(cfg.get("outputs_root")) if isinstance(cfg.get("outputs_root"), str) else None)
+        anchored_fields = resolver.expand_fields(fields, recurse=recurse)
+        use_field = anchored_fields[0]
+
+        # Resolve weights
+        weights_path: str | None = None
+        candidates: list[str] = []
+        if isinstance(weights, str) and weights.strip():
+            candidates.append(weights)
+        for k in ("weights", "weights_path", "save_weights"):
+            v = cfg.get(k, None)
+            if isinstance(v, str) and v.strip():
+                candidates.append(v)
+        resolved_candidates: list[str] = []
+        for w in candidates:
+            p = Path(w)
+            if not p.is_absolute():
+                p = (self.cfg_path.parent / p).resolve()
+            resolved_candidates.append(str(p))
+            if p.exists():
+                weights_path = str(p)
+                break
+        if weights_path is None:
+            runs_dir = (self.cfg_path.parent / "runs").resolve()
+            latest = None
+            if runs_dir.exists() and runs_dir.is_dir():
+                files = list(runs_dir.glob("*.pth")) + list(runs_dir.glob("*.pt"))
+                if files:
+                    latest = max(files, key=lambda f: f.stat().st_mtime)
+            if latest is not None:
+                weights_path = str(latest)
+                self.console.info(f"Auto-selected latest weights from runs/: {weights_path}")
+        if weights_path is None:
+            tried = ", ".join(resolved_candidates) or "<none>"
+            raise RuntimeError(
+                f"Weights file not provided or not found. Pass --weights, set weights/weights_path/save_weights in config, or place a .pth/.pt in runs/. Tried: {tried}"
+            )
+        self.console.info(f"Using weights: {weights_path}")
+
+        # Build model
+        try:
+            in_ch = infer_input_channels_from_field(cfg, use_field)
+        except Exception as e:
+            raise RuntimeError(f"Failed to infer input channels from field: {e}") from e
+        model = build_model(cfg, inferred_in_ch=in_ch).to(self.device)
+        load_weights(model, Path(weights_path), self.device)
+        self.console.info("Model and weights loaded.")
+
+        # Options and outputs
+        gen_hm = bool(cfg.get("generate_heatmap", True))
+        gen_cm = bool(cfg.get("generate_confusion_matrix", True))
+        output = output or cfg.get("output", None)
+        probs_out = probs_out or cfg.get("probs_out", None)
+        logits_out = logits_out or cfg.get("logits_out", None)
+        heatmaps_dir = heatmaps_dir or cfg.get("heatmaps_dir", None)
+        stitch_heatmap = stitch_heatmap or cfg.get("stitched_heatmap", None)
+        cm_csv = cm_csv or cfg.get("cm_csv", None)
+        cm_png = cm_png or cfg.get("cm_png", None)
+        if not show_heatmap:
+            show_heatmap = bool(cfg.get("show_heatmap", False))
+        if not gen_hm:
+            heatmaps_dir = None
+            stitch_heatmap = None
+        if not gen_cm:
+            cm_csv = None
+            cm_png = None
+
+        out_path = resolver.anchor(output) if output else None
+        probs_path = resolver.anchor(probs_out) if probs_out else None
+        logits_path = resolver.anchor(logits_out) if logits_out else None
+        heat_dir, stitch_path = resolver.decide_heatmap_paths(generate=gen_hm, heatmaps_dir=heatmaps_dir, stitched=stitch_heatmap)
+        cm_csv_path, cm_png_path = resolver.decide_cm_paths(generate=gen_cm, cm_csv=cm_csv, cm_png=cm_png)
+
+        # File labels manifest
+        labels_map: dict[str, int] | None = None
+        use_manifest = file_labels if (isinstance(file_labels, str) and file_labels.strip()) else cfg.get("file_labels", cfg.get("file_labels_manifest", None))
+        if isinstance(use_manifest, str) and use_manifest.strip():
+            p = Path(use_manifest)
+            if not p.is_absolute():
+                p = (self.cfg_path.parent / p).resolve()
+            if p.exists():
+                try:
+                    import csv
+                    labels_map = {}
+                    with p.open("r", encoding="utf-8") as f:
+                        reader = csv.reader(f)
+                        rows = list(reader)
+                    start = 0
+                    if rows and len(rows[0]) >= 2 and not str(rows[0][1]).strip().isdigit():
+                        start = 1
+                    for r in rows[start:]:
+                        if len(r) < 2:
+                            continue
+                        name = str(r[0]).strip()
+                        try:
+                            lab = int(str(r[1]).strip())
+                        except Exception:
+                            continue
+                        if name:
+                            labels_map[name.lower()] = lab
+                            labels_map[Path(name).name.lower()] = lab
+                            labels_map[Path(name).stem.lower()] = lab
+                    self.console.info(f"Loaded file labels manifest: {p}")
+                except Exception as e:
+                    self.console.warn(f"Failed to load file labels manifest '{p}': {e}")
+
+        # Summary path
+        file_summary_path: Path | None = None
+        if isinstance(file_summary, str) and file_summary.strip():
+            file_summary_path = resolver.anchor(file_summary)
+        effective_summary_path = file_summary_path
+        if file_summary_path is not None:
+            try:
+                file_summary_path.parent.mkdir(parents=True, exist_ok=True)
+                # Only probe lock if the file already exists; avoid creating it early so header logic can run
+                if file_summary_path.exists():
+                    try:
+                        with file_summary_path.open("a", encoding="utf-8"):
+                            pass
+                    except Exception:
+                        from datetime import datetime
+                        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                        alt = file_summary_path.with_name(f"{file_summary_path.stem}-{ts}{file_summary_path.suffix}")
+                        alt.parent.mkdir(parents=True, exist_ok=True)
+                        effective_summary_path = alt
+                        self.console.info(f"Summary file locked ('{file_summary_path}'); using '{alt}' for this run.")
+            except Exception as e:
+                self.console.warn(f"Failed to establish file summary path: {e}")
+
+        cm_accum: "np.ndarray | None" = None
+        for fp in anchored_fields:
+            stem = Path(fp).stem
+            per_out = out_path.with_name(f"{out_path.stem}-{stem}{out_path.suffix}") if out_path is not None else None
+            per_probs = probs_path.with_name(f"{probs_path.stem}-{stem}{probs_path.suffix}") if probs_path is not None else None
+            per_logits = logits_path.with_name(f"{logits_path.stem}-{stem}{logits_path.suffix}") if logits_path is not None else None
+            per_heat_dir = (heat_dir / stem) if heat_dir is not None else None
+            per_stitch = stitch_path.with_name(f"{stitch_path.stem}-{stem}{stitch_path.suffix}") if stitch_path is not None else None
+            per_cm_csv = cm_csv_path.with_name(f"{cm_csv_path.stem}-{stem}{cm_csv_path.suffix}") if cm_csv_path is not None else None
+            per_cm_png = cm_png_path.with_name(f"{cm_png_path.stem}-{stem}{cm_png_path.suffix}") if cm_png_path is not None else None
+
+            ret_cm = run_inference(
+                cfg,
+                self.device,
+                model,
+                fp,
+                per_out,
+                probs_out=per_probs,
+                logits_out=per_logits,
+                heatmaps_dir=per_heat_dir,
+                heatmap_class=heatmap_class,
+                stitch_heatmap_path=per_stitch,
+                labels_csv=Path(labels_csv) if labels_csv else None,
+                label_all=(
+                    (
+                        labels_map.get(Path(fp).name.lower(), labels_map.get(Path(fp).stem.lower()))
+                        if labels_map is not None
+                        else label_all
+                    )
+                    if label_all is None
+                    else label_all
+                ),
+                labels_array=labels_array,
+                class_names=class_names,
+                cm_csv_out=per_cm_csv,
+                cm_png_out=per_cm_png,
+                show_heatmap=show_heatmap,
+                file_summary_out=effective_summary_path,
+            )
+            if ret_cm is not None:
+                import numpy as _np
+                cm_accum = ret_cm.copy() if cm_accum is None else (cm_accum + ret_cm)
+
+        if cm_accum is not None:
+            try:
+                overall_csv = cm_csv_path.with_name(f"{cm_csv_path.stem}-overall{cm_csv_path.suffix}") if cm_csv_path is not None else None
+                overall_png = cm_png_path.with_name(f"{cm_png_path.stem}-overall{cm_png_path.suffix}") if cm_png_path is not None else None
+                save_confusion_outputs(cm_accum, class_names, overall_csv, overall_png, console=self.console)
+            except Exception as e:
+                self.console.warn(f"Failed to save overall confusion matrix: {e}")
+    class InferenceRunner:
+        """
+        High-level, class-based inference runner for prototype two.
+        Keeps CLI thin and supports the same config keys as prototype one.
+        """
+
+    def __init__(self, cfg_path: Path, device_pref: str = "auto") -> None:
+        # Use centralized ConfigManager to load/normalize config
+        cfg_mgr = ConfigManager(cfg_path)
+        self.cfg_path = cfg_mgr.path
+        self.config = cfg_mgr.config
+        # Prefer explicit device selection via DeviceSelector to honor CLI override
+        self.device = DeviceSelector.choose(device_pref)
+        # Initialize console/log formatting
+        self.console = console_from_config(self.config)
+        self.console.info(f"Loaded config from: {self.cfg_path}")
+        self.console.info(f"Using device: {self.device}")
 
     def run(
         self,
@@ -554,73 +677,26 @@ class InferenceRunner:
     ) -> None:
         # Resolve field paths (arg overrides config). Support list or delimited string.
         fields: list[str] = []
+        # CLI overrides config
         if isinstance(field_path, str) and field_path.strip():
-            s = field_path.strip()
-            parts = [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]
-            fields = parts if len(parts) > 1 else [s]
+            fields = parse_field_paths(field_path)
         else:
+            # Prefer explicit field_path; else train/test based on use_test
             fp_cfg = self.config.get("field_path", None)
-            if isinstance(fp_cfg, (list, tuple)):
-                fields = [str(p) for p in fp_cfg if str(p).strip()]
-            elif isinstance(fp_cfg, str) and fp_cfg.strip():
-                fields = [fp_cfg]
-            else:
+            fields = parse_field_paths(fp_cfg)
+            if not fields:
                 use_test = bool(self.config.get("use_test", False))
                 key = "test_field_path" if use_test else "train_field_path"
-                alt = self.config.get(key, None)
-                if isinstance(alt, (list, tuple)):
-                    fields = [str(p) for p in alt if str(p).strip()]
-                elif isinstance(alt, str) and alt.strip():
-                    fields = [alt]
+                fields = parse_field_paths(self.config.get(key, None))
         if not fields:
             raise RuntimeError("field_path or test/train_field_path must be provided via CLI or config")
 
-        # Anchor to config directory and expand directories/globs
-        anchored_fields: list[str] = []
-        expanded: list[str] = []
-        for f in fields:
-            raw = f
-            p = Path(f)
-            if not p.is_absolute():
-                p = (self.cfg_path.parent / p).resolve()
-
-            # Expand glob patterns relative to the config dir (supports **)
-            if any(ch in raw for ch in "*?[]"):
-                try:
-                    parent = p.parent
-                    pattern = p.name
-                    for m in parent.glob(pattern):
-                        if m.is_file():
-                            expanded.append(str(m.resolve()))
-                except Exception:
-                    pass
-                continue
-
-            # If directory, collect CSV and NumPy files (optionally recursive)
-            if p.is_dir():
-                try:
-                    patterns = ["*.csv", "*.npy", "*.npz"]
-                    found = []
-                    for patt in patterns:
-                        it = p.rglob(patt) if recurse else p.glob(patt)
-                        for m in it:
-                            if m.is_file():
-                                found.append(str(m.resolve()))
-                    expanded.extend(found)
-                    # Report discovery counts by type
-                    def _cnt(ext: str) -> int:
-                        return sum(1 for f in found if f.lower().endswith(ext))
-                    print(
-                        f"Discovered {_cnt('.csv')} CSV, {_cnt('.npy')} NPY, {_cnt('.npz')} NPZ files under: {p}"
-                    )
-                except Exception:
-                    pass
-            else:
-                anchored_fields.append(str(p))
-
-        if expanded:
-            uniq = sorted({x for x in expanded})
-            anchored_fields.extend(uniq)
+        # Anchor/expand with PathResolver
+        resolver = PathResolver(
+            self.cfg_path,
+            outputs_root=str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None,
+        )
+        anchored_fields: list[str] = resolver.expand_fields(fields, recurse=recurse)
         # Primary field for building model / inferring channels
         use_field = anchored_fields[0]
 
@@ -651,13 +727,13 @@ class InferenceRunner:
                     latest = max(files, key=lambda f: f.stat().st_mtime)
             if latest is not None:
                 weights_path = str(latest)
-                print(f"Auto-selected latest weights from runs/: {weights_path}")
+                self.console.info(f"Auto-selected latest weights from runs/: {weights_path}")
         if weights_path is None:
             tried = ", ".join(resolved_candidates) or "<none>"
             raise RuntimeError(
                 f"Weights file not provided or not found. Pass --weights, set weights/weights_path/save_weights in config, or place a .pth/.pt in runs/. Tried: {tried}"
             )
-        print(f"Using weights: {weights_path}")
+        self.console.info(f"Using weights: {weights_path}")
 
         # Infer channels, build model, load weights
         try:
@@ -666,7 +742,7 @@ class InferenceRunner:
             raise RuntimeError(f"Failed to infer input channels from field: {e}") from e
         model = build_model(self.config, inferred_in_ch=in_ch).to(self.device)
         load_weights(model, Path(weights_path), self.device)
-        print("Model and weights loaded.")
+        self.console.info("Model and weights loaded.")
 
         # Resolve optional outputs from CLI or fallback to config
         cfg = self.config
@@ -751,9 +827,9 @@ class InferenceRunner:
                         labels_map[name.lower()] = lab
                         labels_map[Path(name).name.lower()] = lab
                         labels_map[Path(name).stem.lower()] = lab
-                print(f"Loaded file labels manifest: {labels_manifest_path}")
+                self.console.info(f"Loaded file labels manifest: {labels_manifest_path}")
             except Exception as e:
-                print(f"[warn] Failed to load file labels manifest '{labels_manifest_path}': {e}")
+                self.console.warn(f"Failed to load file labels manifest '{labels_manifest_path}': {e}")
 
         # Decide heatmap paths (auto-default under outputs_root when enabled)
         heat_dir, stitch_path = resolver.decide_heatmap_paths(
@@ -787,11 +863,12 @@ class InferenceRunner:
                     alt = file_summary_path.with_name(f"{file_summary_path.stem}-{ts}{file_summary_path.suffix}")
                     alt.parent.mkdir(parents=True, exist_ok=True)
                     effective_summary_path = alt
-                    print(f"[info] Summary file locked ('{file_summary_path}'); using '{alt}' for this run.")
+                    self.console.info(f"Summary file locked ('{file_summary_path}'); using '{alt}' for this run.")
                 except Exception as e:
-                    print(f"[warn] Failed to establish file summary path: {e}")
+                    self.console.warn(f"Failed to establish file summary path: {e}")
 
         # Run inference for each field path; suffix outputs by input stem to avoid overwrites
+        cm_accum: "np.ndarray | None" = None
         for fp in anchored_fields:
             stem = Path(fp).stem
             per_out = out_path.with_name(f"{out_path.stem}-{stem}{out_path.suffix}") if out_path is not None else None
@@ -812,7 +889,7 @@ class InferenceRunner:
                 cm_png_path.with_name(f"{cm_png_path.stem}-{stem}{cm_png_path.suffix}") if cm_png_path is not None else None
             )
 
-            run_inference(
+            ret_cm = run_inference(
                 self.config,
                 self.device,
                 model,
@@ -840,6 +917,22 @@ class InferenceRunner:
                 show_heatmap=show_heatmap,
                 file_summary_out=effective_summary_path,
             )
+            if ret_cm is not None:
+                import numpy as _np
+                cm_accum = ret_cm.copy() if cm_accum is None else (cm_accum + ret_cm)
+
+        # After processing all files, save an overall confusion matrix if any
+        if cm_accum is not None:
+            try:
+                overall_csv = None
+                overall_png = None
+                if cm_csv_path is not None:
+                    overall_csv = cm_csv_path.with_name(f"{cm_csv_path.stem}-overall{cm_csv_path.suffix}")
+                if cm_png_path is not None:
+                    overall_png = cm_png_path.with_name(f"{cm_png_path.stem}-overall{cm_png_path.suffix}")
+                save_confusion_outputs(cm_accum, class_names, overall_csv, overall_png, console=self.console)
+            except Exception as e:
+                self.console.warn(f"Failed to save overall confusion matrix: {e}")
 
 
 def main() -> None:

@@ -20,8 +20,9 @@ except Exception:  # pragma: no cover
     cudnn = None  # type: ignore
 
 from cnn_model import SimpleCNN, count_parameters
+from console import console_from_config
 from cnn_optim import CnnOptim
-from common import DeviceSelector, ConfigManager, PathResolver
+from common import DeviceSelector, ConfigManager, PathResolver, infer_input_channels_from_field
 from vector_field_data import (
     ensure_chw,
     load_vector_field,
@@ -60,20 +61,19 @@ class ModelManager:
                 if str(self.config.get("field_path", "") or "").strip()
                 else ("config.test_field_path" if bool(self.config.get("use_test", False)) else "config.train_field_path")
             )
-            print(f"Inferring input_channels from: {field_path} [source={src}]")
+            c = console_from_config(self.config)
+            c.info(f"Inferring input_channels from: {field_path} [source={src}]")
             try:
-                field_array = load_vector_field(field_path, mmap=True)
-                channels_first = ensure_chw(field_array)
-                c = int(channels_first.shape[0])
-                if bool(self.config.get("add_magnitude", True)) and c >= 2:
-                    c = c + 1
-                self.config["input_channels"] = c
+                inferred = infer_input_channels_from_field(self.config, field_path)
+                self.config["input_channels"] = int(inferred)
             except Exception as e:
-                print(f"[warn] Could not infer input_channels from field_path: {e}")
+                c.warn(f"Could not infer input_channels from field_path: {e}")
 
         model = SimpleCNN(self.config).to(self.device)
-        print(model)
-        print(f"Trainable parameters: {count_parameters(model):,}")
+        c = console_from_config(self.config)
+        c.info(str(model))
+        c = console_from_config(self.config)
+        c.info(f"Trainable parameters: {count_parameters(model):,}")
         return model
 
     def make_dummy_input(self) -> "torch.Tensor":
@@ -100,7 +100,8 @@ class ModelManager:
                 use_field = self._select_path(self.config.get(key, "") or "")
                 src = f"config.{key}"
         if isinstance(use_field, str) and use_field.strip():
-            print(f"Using vector field: {use_field} [source={src}]")
+            c = console_from_config(self.config)
+            c.info(f"Using vector field: {use_field} [source={src}]")
             tile_size = tuple(self.config.get("tile_size", [256, 256]))
             stride_config = self.config.get("tile_stride", None)
             stride = None
@@ -117,7 +118,8 @@ class ModelManager:
                 normalize=normalize,
                 limit_tiles=None if limit_tiles is None else int(limit_tiles),
             )
-            print(f"Loaded tiles: shape={tile_batch.shape}")
+            c = console_from_config(self.config)
+            c.info(f"Loaded tiles: shape={tile_batch.shape}")
             return torch.from_numpy(tile_batch).to(self.device)
         return self.make_dummy_input()
 
@@ -177,14 +179,16 @@ def main() -> None:
     try:
         inputs = manager.load_inputs(field_path=args.field_path)
         logits = manager.model(inputs)
-        print(f"Forward pass OK. Logits shape: {tuple(logits.shape)}")
+        c = console_from_config(config_manager.config)
+        c.info(f"Forward pass OK. Logits shape: {tuple(logits.shape)}")
         optimizer = manager.create_optimizer()
     except Exception as e:
         raise RuntimeError(f"Error during forward/optimizer setup: {e}") from e
 
     # Optional: save model weights/checkpoint
     if bool(args.no_save) or bool(config_manager.config.get("no_save", False)):
-        print("Skipping save: no_save is set")
+        c = console_from_config(config_manager.config)
+        c.info("Skipping save: no_save is set")
     else:
         save_path = args.save_weights if args.save_weights else config_manager.config.get("save_weights", None)
         if not (isinstance(save_path, str) and save_path.strip()):
@@ -193,7 +197,8 @@ def main() -> None:
             oroot = config_manager.config.get("outputs_root", None)
             resolver = PathResolver(config_manager.path, outputs_root=oroot if isinstance(oroot, str) else None)
             default_sp = (resolver.outputs_root / "checkpoints" / f"model-{ts}.pth").resolve()
-            print(f"No save_weights provided; defaulting to: {default_sp}")
+            c = console_from_config(config_manager.config)
+            c.info(f"No save_weights provided; defaulting to: {default_sp}")
             save_path = str(default_sp)
         sp = Path(save_path)
         sp.parent.mkdir(parents=True, exist_ok=True)
@@ -207,7 +212,8 @@ def main() -> None:
             except Exception:
                 pass
         torch.save(checkpoint, str(sp))
-        print(f"Saved checkpoint to: {sp}")
+        c = console_from_config(config_manager.config)
+        c.success(f"Saved checkpoint to: {sp}")
 
 
 if __name__ == "__main__":

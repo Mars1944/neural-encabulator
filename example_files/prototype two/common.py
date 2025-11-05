@@ -39,6 +39,7 @@ except Exception:  # pragma: no cover
     cudnn = None  # type: ignore
 
 from vector_field_data import ensure_chw, load_vector_field
+from console import console_from_config
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +243,16 @@ class ConfigManager:
             "stitched_heatmap": "str",
             "labels_npy": "str",
             "class_names": "list[str]",
+            # Additional inference/CLI convenience keys
+            "file_labels": "str",
+            "file_labels_manifest": "str",
+            "file_summary": "str",
+            "auto_dump_labels_template": "bool",
+            "cm_debug": "bool",
+            "heatmap_tile_size": "int",
+            # Logging controls
+            "log_to_file": "bool",
+            "log_file": "str",
             "viewer_values_csv": "str",
             "viewer_title": "str",
             "viewer_cmap": "str",
@@ -253,7 +264,7 @@ class ConfigManager:
         for k in list(config.keys()):
             if k not in expected:
                 # Only warn; do not error to allow forward-compat keys
-                print(f"[warn] Unknown config key: '{k}'")
+                console_from_config(config).warn(f"Unknown config key: '{k}'")
 
         # Common defaults
         config.setdefault("model_type", "cnn")
@@ -466,6 +477,48 @@ class PathResolver:
     def default_cm_png(self) -> Path:
         return (self.outputs_root / "confusion_matrix.png").resolve()
 
+    def expand_fields(
+        self,
+        inputs: list[str],
+        recurse: bool = False,
+        patterns: "list[str] | None" = None,
+    ) -> list[str]:
+        """Anchor and expand a list of file/dir/glob inputs to concrete file paths.
+
+        - Anchors relative to the config directory
+        - Expands glob patterns (supports **)
+        - If a directory is given, collects files matching patterns
+        - Default patterns: ["*.csv", "*.npy", "*.npz"]
+        """
+        pats = patterns if isinstance(patterns, list) and patterns else ["*.csv", "*.npy", "*.npz"]
+        out: list[str] = []
+        for raw in inputs:
+            p = Path(raw)
+            if not p.is_absolute():
+                p = (self.base_dir / p).resolve()
+            s = str(p)
+            # Glob pattern
+            if any(ch in s for ch in "*?[]"):
+                parent = p.parent
+                pattern = p.name
+                for m in parent.glob(pattern):
+                    if m.is_file():
+                        out.append(str(m.resolve()))
+                continue
+            # Directory expansion
+            if p.is_dir():
+                for patt in pats:
+                    it = p.rglob(patt) if recurse else p.glob(patt)
+                    for m in it:
+                        if m.is_file():
+                            out.append(str(m.resolve()))
+                continue
+            # File
+            if p.exists() and p.is_file():
+                out.append(str(p))
+        # Deduplicate + stable order
+        return sorted({q for q in out})
+
     def decide_heatmap_paths(
         self,
         *,
@@ -532,3 +585,207 @@ class PathResolver:
         except Exception:
             pass
         return None
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+def parse_field_paths(value: Any) -> list[str]:
+    """
+    Normalize a field path specification into a list of strings.
+
+    Accepts:
+    - str: possibly delimited by ',' or ';' -> split and strip empty items
+    - list/tuple: keep string items that are non-empty after strip
+    - other: returns []
+    """
+    out: list[str] = []
+    try:
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return []
+            parts = [p.strip() for p in s.replace(";", ",").split(",")]
+            out = [p for p in parts if p]
+        elif isinstance(value, (list, tuple)):
+            out = [str(p).strip() for p in value if isinstance(p, (str, Path)) and str(p).strip()]
+    except Exception:
+        return []
+    return out
+
+
+def choose_fields(config: Dict[str, Any], field_path_arg: Any = None) -> list[str]:
+    """
+    Choose field paths in priority order and return as a list[str].
+
+    Priority:
+      1) CLI/explicit argument `field_path_arg`
+      2) config["field_path"]
+      3) config["test_field_path"] if config["use_test"] else config["train_field_path"]
+    """
+    fields = parse_field_paths(field_path_arg)
+    if fields:
+        return fields
+    fields = parse_field_paths(config.get("field_path", None))
+    if fields:
+        return fields
+    use_test = bool(config.get("use_test", False))
+    key = "test_field_path" if use_test else "train_field_path"
+    return parse_field_paths(config.get(key, None))
+
+
+def write_labels_template(tmpl_path: Path, n_tiles: int, predicted: "np.ndarray | list[int] | None" = None) -> None:
+    """
+    Write a labels template CSV with header and N rows.
+
+    Columns:
+      - tile_index
+      - label (pre-filled with -1)
+      - predicted_class (optional; included when `predicted` is provided)
+    """
+    import csv
+    import numpy as _np
+
+    tmpl_path.parent.mkdir(parents=True, exist_ok=True)
+    preds: _np.ndarray | None = None
+    if predicted is not None:
+        try:
+            preds = _np.asarray(predicted, dtype=_np.int64)
+        except Exception:
+            preds = None
+    with tmpl_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        header = ["tile_index", "label"]
+        if preds is not None and preds.size >= n_tiles:
+            header.append("predicted_class")
+        w.writerow(header)
+        for i in range(int(n_tiles)):
+            row = [i, -1]
+            if preds is not None and i < int(preds.shape[0]):
+                row.append(int(preds[i]))
+            w.writerow(row)
+
+
+def save_confusion_outputs(
+    cm: "np.ndarray",
+    class_names: "list[str] | None",
+    cm_csv_out: "Path | None",
+    cm_png_out: "Path | None",
+    console=None,
+) -> None:
+    """Save confusion matrix artifacts (CSV, WEKA-style .txt, PNG) with robust fallbacks.
+
+    - CSV: counts with header row/col labels
+    - TXT: WEKA-style labeled matrix saved alongside CSV/PNG (with same stem)
+    - PNG: column-normalized heatmap using matplotlib if available, else PIL, else saves NPY
+    """
+    import numpy as _np
+    from pathlib import Path as _Path
+
+    def _log_ok(msg: str) -> None:
+        try:
+            if console is not None:
+                console.success(msg)
+            else:
+                print(msg)
+        except Exception:
+            pass
+
+    def _log_warn(msg: str) -> None:
+        try:
+            if console is not None:
+                console.warn(msg)
+            else:
+                print(f"[warn] {msg}")
+        except Exception:
+            pass
+
+    num_classes = int(cm.shape[0]) if cm.ndim == 2 else 0
+    # CSV
+    if cm_csv_out is not None:
+        try:
+            import csv as _csv
+
+            cm_csv_out.parent.mkdir(parents=True, exist_ok=True)
+            with cm_csv_out.open("w", newline="", encoding="utf-8") as f:
+                w = _csv.writer(f)
+                w.writerow(["true\\pred"] + [f"{j}" for j in range(num_classes)])
+                for i in range(num_classes):
+                    w.writerow([f"{i}"] + [int(cm[i, j]) for j in range(num_classes)])
+            _log_ok(f"Saved confusion matrix CSV to: {cm_csv_out}")
+        except Exception as e:
+            _log_warn(f"Failed to save cm_csv: {e}")
+
+    # WEKA-style TXT
+    try:
+        weka_txt_out: _Path | None = None
+        if cm_csv_out is not None:
+            weka_txt_out = cm_csv_out.with_suffix(".txt")
+        elif cm_png_out is not None:
+            weka_txt_out = cm_png_out.with_suffix(".txt")
+        if weka_txt_out is not None:
+            weka_txt_out.parent.mkdir(parents=True, exist_ok=True)
+            labels = class_names if (class_names and len(class_names) == num_classes) else [f"class{i}" for i in range(num_classes)]
+
+            def code(k: int) -> str:
+                s = ""
+                while True:
+                    s = chr(ord('a') + (k % 26)) + s
+                    k //= 26
+                    if k == 0:
+                        break
+                    k -= 1
+                return s
+
+            max_count = int(cm.max()) if cm.size > 0 else 0
+            cell_w = max(3, len(str(max_count)))
+            lines = [
+                "=== Confusion Matrix ===",
+                "  " + " ".join(code(j).rjust(cell_w) for j in range(num_classes)) + "   <-- classified as",
+            ]
+            for i in range(num_classes):
+                row = " ".join(str(int(cm[i, j])).rjust(cell_w) for j in range(num_classes))
+                lines.append(f" {row} | {code(i)} = {labels[i]}")
+            with weka_txt_out.open("w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            _log_ok(f"Saved WEKA-style CM to: {weka_txt_out}")
+    except Exception as e:
+        _log_warn(f"Failed to save WEKA-style CM: {e}")
+
+    # PNG (column-normalized)
+    if cm_png_out is not None:
+        try:
+            col_sums = cm.sum(axis=0, keepdims=True).astype(_np.float32)
+            norm = _np.divide(cm.astype(_np.float32), _np.maximum(col_sums, 1.0), out=_np.zeros_like(cm, dtype=_np.float32), where=col_sums > 0)
+            labels = class_names if (class_names and len(class_names) == num_classes) else [f"{i}" for i in range(num_classes)]
+            try:
+                import matplotlib.pyplot as _plt  # type: ignore
+
+                _plt.figure(figsize=(max(4, num_classes), max(3, num_classes * 0.6)))
+                im = _plt.imshow(norm, vmin=0.0, vmax=1.0, cmap="viridis")
+                _plt.colorbar(im, fraction=0.046, pad=0.04, label="col-normalized")
+                _plt.xticks(range(num_classes), labels, rotation=45, ha="right")
+                _plt.yticks(range(num_classes), labels)
+                _plt.xlabel("Predicted")
+                _plt.ylabel("True")
+                _plt.title("Confusion Matrix (column-normalized)")
+                _plt.tight_layout()
+                cm_png_out.parent.mkdir(parents=True, exist_ok=True)
+                _plt.savefig(cm_png_out)
+                _plt.close()
+                _log_ok(f"Saved confusion matrix image to: {cm_png_out}")
+            except Exception:
+                from PIL import Image as _Image  # type: ignore
+
+                arr = (_np.clip(norm, 0.0, 1.0) * 255.0).astype(_np.uint8)
+                img = _Image.fromarray(arr, mode="L").resize((num_classes * 32, num_classes * 32), resample=_Image.NEAREST)
+                cm_png_out.parent.mkdir(parents=True, exist_ok=True)
+                img.save(cm_png_out)
+                _log_ok(f"Saved confusion matrix image (grayscale) to: {cm_png_out}")
+        except Exception as e:
+            try:
+                cm_png_out.parent.mkdir(parents=True, exist_ok=True)
+                _np.save(str(cm_png_out.with_suffix(".npy")), cm.astype(_np.float32))
+                _log_warn(f"Could not save CM image; saved counts as NPY: {cm_png_out.with_suffix('.npy')} (error: {e})")
+            except Exception as e2:
+                _log_warn(f"Failed to save confusion matrix image or NPY: {e2}")

@@ -1,0 +1,4 @@
+=== Confusion Matrix ===
+    a   b   <-- classified as
+   0   6 | a = class0
+   0   1 | b = class1

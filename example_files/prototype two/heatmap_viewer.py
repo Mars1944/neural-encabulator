@@ -5,6 +5,7 @@ from typing import Tuple, Optional, Union, Any, Dict
 
 import numpy as np
 from common import ConfigManager, PathResolver
+from console import console_from_config, get_console
 from vector_field_data import load_vector_field, ensure_chw
 
 
@@ -17,15 +18,16 @@ def show_stitched_heatmap(
     show: bool = True,
     save_path: Optional[Union[str, Path]] = None,
 ) -> None:
+    c = get_console()
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception as e:
-        print(f"[warn] matplotlib not available for showing heatmap: {e}")
+        c.warn(f"matplotlib not available for showing heatmap: {e}")
         return
 
     rows, cols = int(grid_shape[0]), int(grid_shape[1])
     if values.ndim != 1 or rows * cols != int(values.shape[0]):
-        print(f"[warn] Cannot reshape values of length {values.shape[0]} into grid {rows}x{cols}")
+        c.warn(f"Cannot reshape values of length {values.shape[0]} into grid {rows}x{cols}")
         return
     grid = values.reshape(rows, cols)
     plt.figure(figsize=(max(4, cols / 4), max(4, rows / 4)))
@@ -40,7 +42,7 @@ def show_stitched_heatmap(
         sp = Path(save_path)
         sp.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(sp)
-        print(f"Saved stitched heatmap to: {sp}")
+        c.success(f"Saved stitched heatmap to: {sp}")
 
     if show:
         plt.show()
@@ -126,7 +128,8 @@ def main() -> None:
             with cfg_path.open("r", encoding="utf-8") as f:
                 cfg_dict = json.load(f)
         except Exception as e:
-            print(f"[warn] Could not parse config '{cfg_path}': {e}")
+            c = get_console()
+            c.warn(f"Could not parse config '{cfg_path}': {e}")
             cfg_dict = None
     else:
         # Auto-discover default config alongside the script
@@ -136,9 +139,11 @@ def main() -> None:
             try:
                 with cfg_path.open("r", encoding="utf-8") as f:
                     cfg_dict = json.load(f)
-                print(f"Using viewer config: {cfg_path}")
+                c = console_from_config(cfg_dict)
+                c.info(f"Using viewer config: {cfg_path}")
             except Exception as e:
-                print(f"[warn] Could not parse default config '{cfg_path}': {e}")
+                c = get_console()
+                c.warn(f"Could not parse default config '{cfg_path}': {e}")
                 cfg_dict = None
 
     # Use PathResolver for consistent anchoring
@@ -167,11 +172,13 @@ def main() -> None:
     )
     if values_npy:
         resolved = _anchor(values_npy)
-        print(f"[info] Loading values from NPY: {resolved}")
+        c = console_from_config(cfg_dict if isinstance(cfg_dict, dict) else {})
+        c.info(f"Loading values from NPY: {resolved}")
         values = np.load(str(resolved))
     elif values_csv:
         resolved = _anchor(values_csv)
-        print(f"[info] Loading values from CSV: {resolved}")
+        c = console_from_config(cfg_dict if isinstance(cfg_dict, dict) else {})
+        c.info(f"Loading values from CSV: {resolved}")
         values = _load_values_from_csv(resolved)
     elif args.values_npy:
         values = np.load(args.values_npy)
@@ -210,7 +217,8 @@ def main() -> None:
             try:
                 config_manager = ConfigManager(config_path)
             except Exception as e:
-                print(f"[warn] Could not load config '{config_path}': {e}")
+                c = get_console()
+                c.warn(f"Could not load config '{config_path}': {e}")
 
         # Resolve field path
         field_path: Optional[str] = args.field_path
