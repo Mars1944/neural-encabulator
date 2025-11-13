@@ -1,0 +1,81 @@
+ASCII Overview: Expected Data Folder Structure (prototype two)
+
+Root (relative to this config/script):
+
+example_files/prototype two/
+└─ data/
+   ├─ training data/                     # optional during inference; used for training
+   │  ├─ image/                          # image training set (class-per-folder)
+   │  │  ├─ classA/ *.jpg|*.png|*.tif
+   │  │  └─ classB/ ...
+   │  ├─ vector/                         # vector-field training set (CSV/NPY/NPZ)
+   │  └─ video/                          # reserved (not used by current CNN)
+   │
+   ├─ testing data/                      # primary source for inference
+   │  ├─ image/                          # image testing set (class-per-folder)
+   │  │  ├─ laminar/     *.png|*.jpg|*.jpeg|*.bmp|*.tif|*.tiff
+   │  │  ├─ turbulent/   *.png|*.jpg|*.jpeg|*.bmp|*.tif|*.tiff
+   │  │  └─ mixed/       *.png|*.jpg|*.jpeg|*.bmp|*.tif|*.tiff
+   │  │
+   │  ├─ file_name.csv                  # optional mapping CSV for vector mode (not for images)
+   │  ├─ laminar sparse_flow_vectors.csv   # optional vector-field examples
+   │  └─ turbulent sparse_flow_vectors.csv # optional vector-field examples
+   │
+   ├─ outputs/                           # all derived artifacts land here (anchored by outputs_root)
+   │  ├─ image/
+   │  │  ├─ file_predictions.csv         # per-file predictions for image mode
+   │  │  ├─ confusion_matrix.csv|.png|.txt  # overall CM (laminar+turbulent)
+   │  │  ├─ plots/                       # per-class plots (laminar/turbulent)
+   │  │  ├─ laminar/
+   │  │  │  └─ cm-laminar.csv|.png|.txt  # CM restricted to laminar folder
+   │  │  ├─ turbulent/
+   │  │  │  └─ cm-turbulent.csv|.png|.txt# CM restricted to turbulent folder
+   │  │  └─ mixed/
+   │  │     └─ pred_distribution-mixed.csv # predicted class distribution for mixed folder
+   │  │
+   │  └─ vector/                         # used when data_kind = vector
+   │     ├─ heatmaps/                    # per-tile heatmaps
+   │     ├─ stitched-*.png               # stitched heatmap(s)
+   │     └─ cm-*.csv|.png|.txt           # vector-mode confusion matrices
+   │
+   └─ sparse_flow_vectors.zip            # optional archive (not used directly)
+
+
+Notes and Requirements
+----------------------
+1) Mode selection (image vs vector)
+   - Set in config.json under inference.common.data_kind: "image" or "vector".
+   - For image mode, the code looks for a container folder (e.g., "testing data") and auto-descends into an "image" subfolder when present.
+   - For vector mode, field_path/test_field_path/train_field_path may point to files, folders, or globs and are expanded.
+
+2) Image datasets
+   - Supported extensions: .jpg, .jpeg, .png, .bmp, .tif, .tiff
+   - Class mapping is derived from subfolder names under the root image directory (e.g., laminar, turbulent, mixed).
+   - Inference writes per-file predictions and an overall confusion matrix (for laminar+turbulent). For mixed, a prediction distribution is saved.
+
+3) Vector-field datasets
+   - Accepted inputs: .csv, .npy, .npz
+   - CSV schema for vector fields:
+       x, y, delta_x, delta_y [, label]
+     The optional 5th column is a sparse label that will be forward-filled to a dense per-pixel map for tiling.
+   - Tiling
+       tile_size: [th, tw], tile_stride: [sh, sw]. Defaults under config/inference/common; inference overrides with inference_tile_* when set.
+   - Vector mode outputs include per-tile heatmaps (optional), stitched heatmaps, and confusion matrices.
+
+4) Outputs root
+   - All derived artifacts are rooted under outputs_root. In config.json, this is typically "data/outputs" (relative to the config).
+   - Image mode defaults to data/outputs/image; vector mode uses data/outputs/vector for derived defaults.
+
+5) Config anchoring
+   - Paths are anchored relative to the config file location. If a path is relative in config.json, it is resolved to an absolute path under the directory that contains config.json.
+
+
+Minimal Checklist
+-----------------
+✔ data/testing data/image/laminar/ and /turbulent/ exist and contain images.
+✔ Optional: data/testing data/image/mixed/ contains images (distribution only).
+✔ config.inference.common.data_kind = "image" (for image inference).
+✔ config.inference.common.file_summary points under data/outputs/image/
+✔ Pillow (PIL) installed (and/or OpenCV if use_opencv_loader is true).
+✔ tqdm installed (optional) to show a live progress bar.
+

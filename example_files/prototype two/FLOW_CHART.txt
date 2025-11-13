@@ -74,6 +74,8 @@ Inference path
    CLI                                                 | infer.py: InferenceRunner  |
 +---------+  device-> DeviceSelector                   | - resolve field + weights  |
 | infer.py | ----------------------------------------> | - infer_input_channels     |
+                                                  (vector) or
+                                                  | - image config channels      |
 +---------+                                            | - build SimpleCNN          |
                                                        | - load_weights             |
                                                        +-------------+--------------+
@@ -81,11 +83,17 @@ Inference path
                                                                      | tiles/probs/logits
                                                                      v
                                                        +----------------------------+
-                                                       | run_inference              |
-                                                       | - vector_field_data tiles  |
-                                                       | - model logits/probs/conf  |
-                                                       | - optional save CSV/NPY    |
-                                                       | - HeatmapGenerator         |
+| run_inference (vector)     |
+| - vector_field_data tiles  |
+| - model logits/probs/conf  |
+| - optional save CSV/NPY    |
+| - HeatmapGenerator         |
+|                            |
+| run_image_inference        |
+| - iterate test_image_dir   |
+| - per-image logits/probs   |
+| - optional predictions CSV |
+| - optional confusion matrix|
                                                        +-------------+--------------+
                                                                      |
                                                               images/NPY outputs
@@ -114,4 +122,3 @@ Legend
 Notes
 - All paths are resolved via common.PathResolver; outputs_root controls where artifacts land.
 - All entry points accept --config and default to example_files/prototype two/config.json.
-

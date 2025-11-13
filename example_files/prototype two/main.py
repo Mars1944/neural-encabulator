@@ -23,6 +23,11 @@ from cnn_model import SimpleCNN, count_parameters
 from console import console_from_config
 from cnn_optim import CnnOptim
 from common import DeviceSelector, ConfigManager, PathResolver, infer_input_channels_from_field
+from common import PathResolver as _PR  # for resolve_split_kind
+try:
+    from image_data import build_class_index
+except Exception:
+    build_class_index = None  # type: ignore
 from vector_field_data import (
     ensure_chw,
     load_vector_field,
@@ -48,7 +53,32 @@ class ModelManager:
         return str(value or "")
 
     def _build_model(self) -> "torch.nn.Module":
-        # Infer channels from vector-field file if provided
+        # Decide data kind for model input
+        kind = _PR.resolve_split_kind(self.config, "train") if hasattr(_PR, "resolve_split_kind") else str(self.config.get("data_kind", "vector")).lower()
+
+        # Image path: set channels from config and optionally derive num_classes from directory
+        if kind.startswith("image"):
+            cfg = dict(self.config)
+            in_ch = int(cfg.get("image_channels", 3))
+            cfg["input_channels"] = in_ch
+            # If class_names provided, align num_classes
+            cls_names = cfg.get("class_names", None)
+            if isinstance(cls_names, list) and len(cls_names) > 0:
+                cfg["num_classes"] = int(len(cls_names))
+            else:
+                # Try to infer from train_image_dir if available and build_class_index exists
+                tid = cfg.get("train_image_dir", None)
+                if build_class_index is not None and isinstance(tid, str) and tid.strip():
+                    try:
+                        mapping = build_class_index(Path(tid))
+                        if mapping:
+                            cfg["num_classes"] = int(len(mapping))
+                    except Exception:
+                        pass
+            model = SimpleCNN(cfg)
+            return model
+
+        # Vector path: infer channels from vector-field file if provided
         field_path = self._select_path(self.config.get("field_path", ""))
         if not field_path.strip():
             use_test = bool(self.config.get("use_test", False))
@@ -62,9 +92,47 @@ class ModelManager:
                 else ("config.test_field_path" if bool(self.config.get("use_test", False)) else "config.train_field_path")
             )
             c = console_from_config(self.config)
-            c.info(f"Inferring input_channels from: {field_path} [source={src}]")
+            # If a directory or glob-like value was provided, expand to actual files
             try:
-                inferred = infer_input_channels_from_field(self.config, field_path)
+                cfg_path = Path(self.config.get("_config_path", Path(__file__).with_name("config.json")))
+                resolver = PathResolver(cfg_path, outputs_root=str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None)
+                looks_like_dir = False
+                p = Path(field_path)
+                if (not p.suffix) or any(ch in field_path for ch in ("*", "?", "[")):
+                    looks_like_dir = True
+                candidates = resolver.expand_fields([field_path], recurse=True) if looks_like_dir else [str((cfg_path.parent / p).resolve()) if not p.is_absolute() else str(p)]
+                # Prefer actual vector field inputs (CSV with x/y/dx/dy header, or NPY/NPZ)
+                def _is_vector_candidate(path_str: str) -> bool:
+                    try:
+                        q = Path(path_str)
+                        ext = q.suffix.lower()
+                        if ext in (".npy", ".npz"):
+                            return True
+                        if ext == ".csv":
+                            with q.open("r", encoding="utf-8", errors="ignore") as f:
+                                first = f.readline().lower()
+                            # Exclude mapping CSVs like file_name,label
+                            if ("file_name" in first and "label" in first):
+                                return False
+                            return any(k in first for k in ("x", "y", "delta", "dx", "dy"))
+                        return False
+                    except Exception:
+                        return False
+
+                chosen: str | None = None
+                for cand in candidates:
+                    if Path(cand).is_file() and _is_vector_candidate(cand):
+                        chosen = cand
+                        break
+                if chosen is None:
+                    # Fallback to first regular file if no obvious vector candidate found
+                    for cand in candidates:
+                        if Path(cand).is_file():
+                            chosen = cand
+                            break
+                use_for_infer = chosen if chosen is not None else field_path
+                c.info(f"Inferring input_channels from: {use_for_infer} [source={src}]")
+                inferred = infer_input_channels_from_field(self.config, use_for_infer)
                 self.config["input_channels"] = int(inferred)
             except Exception as e:
                 c.warn(f"Could not infer input_channels from field_path: {e}")

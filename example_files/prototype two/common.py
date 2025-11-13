@@ -164,6 +164,20 @@ class ConfigManager:
                 torch.set_float32_matmul_precision(prec)  # type: ignore[attr-defined]
         except Exception:
             pass
+        # Allow TF32 on Ampere/ADA when requested
+        try:
+            allow_tf32 = bool(self.config.get("allow_tf32", False))
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = allow_tf32  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            if cudnn is not None:
+                try:
+                    cudnn.allow_tf32 = allow_tf32  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _validate_and_normalize(self) -> None:
         config = self.config
@@ -172,9 +186,33 @@ class ConfigManager:
         for sec in ("paths", "data", "model", "training", "inference", "viewer"):
             sec_dict = config.get(sec, None)
             if isinstance(sec_dict, dict):
-                for k, v in sec_dict.items():
-                    if k not in config:
-                        config[k] = v
+                # For 'inference', avoid lifting nested subsections ('common','image','vector') to top-level here;
+                # they are handled explicitly below.
+                if sec == "inference" and any(k in sec_dict for k in ("common", "image", "vector")):
+                    pass
+                else:
+                    for k, v in sec_dict.items():
+                        if k not in config:
+                            config[k] = v
+
+        # Support new inference layout: inference = { common: {..., data_kind: image|vector}, image: {...}, vector: {...} }
+        inf = self.config.get("inference", None)
+        if isinstance(inf, dict) and any(k in inf for k in ("common", "image", "vector")):
+            common = inf.get("common", {}) if isinstance(inf.get("common", {}), dict) else {}
+            # Merge common onto top-level (do not overwrite)
+            for k, v in common.items():
+                if k not in self.config:
+                    self.config[k] = v
+            # Determine mode from inference.common (prefer explicit), else fall back to existing keys
+            mode_raw = str(common.get("data_kind", common.get("mode", self.config.get("data_kind", "vector")))).lower()
+            selected = "image" if mode_raw.startswith("image") else "vector"
+            # Merge selected subsection
+            sub = inf.get(selected, {}) if isinstance(inf.get(selected, {}), dict) else {}
+            for k, v in sub.items():
+                if k not in self.config:
+                    self.config[k] = v
+            # Ensure data_kind reflects the selected mode
+            self.config.setdefault("data_kind", selected)
         # Expected keys union from training/inference paths
         expected: Dict[str, str] = {
             "seed": "int",
@@ -205,6 +243,11 @@ class ConfigManager:
             "save_weights": "str",
             "train_field_path": "str",
             "test_field_path": "str",
+            # Data selection helpers
+            "data_kind": "str",  # one of: vector, image, video
+            "train_data_kind": "str",
+            "val_data_kind": "str",
+            "test_data_kind": "str",
             "use_test": "bool",
             "no_save": "bool",
             # Training/inference extras
@@ -233,6 +276,8 @@ class ConfigManager:
             "inference": "dict",
             "viewer": "dict",
             "outputs_root": "str",
+            # Directory expansion / discovery
+            "recurse": "bool",
             "generate_heatmap": "bool",
             "generate_confusion_matrix": "bool",
             "show_heatmap": "bool",
@@ -243,6 +288,9 @@ class ConfigManager:
             "stitched_heatmap": "str",
             "labels_npy": "str",
             "class_names": "list[str]",
+            # Inference tiling overrides
+            "inference_tile_size": "list[int,int]",
+            "inference_tile_stride": "list[int,int]",
             # Additional inference/CLI convenience keys
             "file_labels": "str",
             "file_labels_manifest": "str",
@@ -260,6 +308,30 @@ class ConfigManager:
             "viewer_save": "str",
             "viewer_rows": "int",
             "viewer_cols": "int",
+            # Image dataset support
+            "train_image_dir": "str",
+            "val_image_dir": "str",
+            "test_image_dir": "str",
+            "image_size": "list[int,int]",
+            "image_channels": "int",
+            "image_mean": "list[float]",
+            "image_std": "list[float]",
+            "augment": "dict",
+            # Inference performance tuning keys (top-level or under inference)
+            "image_infer_batch_size": "int",
+            "mixed_precision": "str",
+            "channels_last": "bool",
+            "prefetch_workers": "int",
+            "torch_compile": "bool",
+            "use_inference_mode": "bool",
+            "allow_tf32": "bool",
+            "use_opencv_loader": "bool",
+            "use_cuda_graphs": "bool",
+            "plot_top_n": "int",
+            # Image inference filters
+            "image_include_classes": "list[str]",
+            "include_classes": "list[str]",
+            
         }
         for k in list(config.keys()):
             if k not in expected:
@@ -277,9 +349,15 @@ class ConfigManager:
         config.setdefault("learning_rate", 1e-3)
         config.setdefault("weight_decay", 0.0)
         config.setdefault("tile_size", [256, 256])
+        # Image defaults
+        config.setdefault("image_size", [256, 256])
+        config.setdefault("image_channels", 3)
+        config.setdefault("image_mean", [0.5])
+        config.setdefault("image_std", [0.5])
 
         # Resolve paths relative to the config file (support str and list[str])
-        for key in ("field_path", "train_field_path", "test_field_path", "save_weights"):
+        for key in ("field_path", "train_field_path", "test_field_path", "save_weights",
+                    "train_image_dir", "val_image_dir", "test_image_dir"):
             fp = config.get(key, "")
             if isinstance(fp, str) and fp.strip():
                 p = Path(fp)
@@ -309,6 +387,13 @@ class ConfigManager:
                 raise ValueError("tile_stride must be [sh, sw] when provided")
             if any(int(x) <= 0 for x in stride):
                 raise ValueError("tile_stride entries must be positive")
+
+        # Validate image_size
+        isz = config.get("image_size", [256, 256])
+        if not (isinstance(isz, (list, tuple)) and len(isz) == 2):
+            raise ValueError("image_size must be [h, w]")
+        if any(int(x) <= 0 for x in isz):
+            raise ValueError("image_size entries must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +465,17 @@ class HeatmapGenerator:
         import numpy as _np
 
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Optional progress bar
+        try:
+            from tqdm import tqdm as _tqdm  # type: ignore
+            _iter = _tqdm(range(len(vals)), desc="heatmaps", unit="tile")
+        except Exception:
+            _iter = range(len(vals))
+
         if self._plt is not None:
             plt = self._plt
-            for i, v in enumerate(vals):
+            for i in _iter:
+                v = vals[i]
                 plt.figure(figsize=(2, 2))
                 plt.imshow(_np.array([[v]]), vmin=0.0, vmax=1.0, cmap=self.cmap)
                 plt.axis("off")
@@ -390,7 +483,8 @@ class HeatmapGenerator:
                 plt.close()
         elif self._PIL_Image is not None:
             Image = self._PIL_Image
-            for i, v in enumerate(vals):
+            for i in _iter:
+                v = vals[i]
                 gray = int(_np.clip(v, 0.0, 1.0) * 255.0)
                 img = Image.fromarray(_np.full((tile_img_size, tile_img_size), gray, dtype=_np.uint8), mode="L")
                 img.save(out_dir / f"tile_{i:05d}.png")
@@ -476,6 +570,16 @@ class PathResolver:
 
     def default_cm_png(self) -> Path:
         return (self.outputs_root / "confusion_matrix.png").resolve()
+
+    # Data-kind helper
+    @staticmethod
+    def resolve_split_kind(config: Dict[str, Any], split: str) -> str:
+        key = f"{split}_data_kind"
+        # Allow inference.common.data_kind to guide selection when present
+        inf = config.get("inference", {}) if isinstance(config.get("inference"), dict) else {}
+        inf_common = inf.get("common", {}) if isinstance(inf.get("common", {}), dict) else {}
+        v = str(config.get(key, inf_common.get("data_kind", config.get("data_kind", "vector")))).lower()
+        return "image" if v.startswith("image") else "vector"
 
     def expand_fields(
         self,

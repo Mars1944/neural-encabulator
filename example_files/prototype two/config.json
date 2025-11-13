@@ -15,18 +15,16 @@
   "model_type": "cnn",
 
   "data": {
-    "test_field_path": [
-      "data/testing data/laminar sparse_flow_vectors.csv",
-      "data/testing data/turbulent sparse_flow_vectors.csv"],
-    "train_field_path": [
-      "data/training data/Laminar_sparse_flow_vectors_large.csv",
-      "data/training data/Turbulent_sparse_flow_vectors_large.csv"
-    ],
+    "data_kind": "image",
+    "train_image_dir": "data/training data/image",
+    "test_image_dir": "data/testing data/image",
+    "image_size": [256, 256],
+    "image_channels": 3,
     "tile_size": [256, 256],
     "tile_stride": [256, 256],
     "add_magnitude": true,
     "normalize": true,
-    "limit_tiles": 64
+    "limit_tiles": null
   },
 
   "model": {
@@ -49,24 +47,44 @@
     "weight_decay": 0.0,
     "optimizer": "adamw",
     "scheduler": "none",
-    "max_epochs": 200,
+    "max_epochs": 50,
     "train_source_labels": [2, 1]
   },
 
   "inference": {
-    "use_test": true,
-    "file_labels": "data/testing data/file_name.csv",
-    "file_summary": "data/outputs/file_predictions.csv",
-    "generate_heatmap": true,
-    "generate_confusion_matrix": true,
-    "show_heatmap": false,
-    "heatmap_class": 0,
-    "cm_csv": "data/outputs/confusion_matrix.csv",
-    "cm_png": "data/outputs/confusion_matrix.png",
-    "heatmaps_dir": "data/outputs/heatmaps",
-    "stitched_heatmap": "data/outputs/stitched_heatmap.png",
-    "labels_npy": "",
-    "class_names": ["turbulent","laminar" ]
+    "common": {
+      "data_kind": "image",
+      "use_test": true,
+      "file_labels": "data/testing data/file_name.csv",
+      "file_summary": "data/outputs/image/file_predictions.csv",
+      "recurse": true,
+      "generate_heatmap": true,
+      "generate_confusion_matrix": true,
+      "show_heatmap": false,
+      "heatmap_class": 0,
+      "cm_csv": "data/outputs/image/confusion_matrix.csv",
+      "cm_png": "data/outputs/image/confusion_matrix.png",
+      "heatmaps_dir": "data/outputs/heatmaps",
+      "stitched_heatmap": "data/outputs/stitched_heatmap.png",
+      "class_names": ["turbulent", "laminar"],
+      "mixed_precision": "fp16",
+      "channels_last": true,
+      "pin_memory": true,
+      "prefetch_workers": 0,
+      "torch_compile": false,
+      "use_inference_mode": true,
+      "allow_tf32": true,
+      "use_opencv_loader": false,
+      "plot_top_n": 50,
+      "image_include_classes": ["mixed"]
+    },
+    "image": {
+      "image_infer_batch_size": 32
+    },
+    "vector": {
+      "inference_tile_size": [77, 128],
+      "inference_tile_stride": [77, 32]
+    }
   },
 
   "viewer": {

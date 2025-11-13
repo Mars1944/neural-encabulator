@@ -12,8 +12,14 @@ from vector_field_data import (
     load_vector_field_tiles,
     load_vector_field_tiles_with_labels,
 )
-from common import load_labels_from_csv, parse_field_paths
+from common import load_labels_from_csv, parse_field_paths, PathResolver
 from console import console_from_config
+from common import PathResolver as _PR
+try:
+    from image_data import ImageFolderDataset, build_class_index
+except Exception:
+    ImageFolderDataset = None  # type: ignore
+    build_class_index = None  # type: ignore
 
 
 def _prepare_labels(
@@ -100,6 +106,201 @@ class Trainer:
         self.optim_builder = CnnOptim(self.config)
         self.optimizer, self.scheduler, self.scheduler_step_on = self.optim_builder.build(self.model)
 
+    def _cnn_min_side(self) -> int:
+        """Minimum spatial side length required by the CNN given max-pooling depth.
+
+        Uses conv_channels length and pool_every to estimate total number of MaxPool2d layers.
+        For N pools with kernel/stride=2, the minimum side is 2**N to preserve at least 1 pixel.
+        """
+        try:
+            conv_channels = self.config.get("conv_channels", [32, 64])
+            pool_every = int(self.config.get("pool_every", 1))
+            if not isinstance(conv_channels, (list, tuple)) or pool_every <= 0:
+                return 1
+            n_blocks = len(conv_channels)
+            n_pools = n_blocks // max(pool_every, 1)
+            return max(1, 2 ** int(n_pools))
+        except Exception:
+            return 1
+
+    def _is_image_mode(self) -> bool:
+        kind = _PR.resolve_split_kind(self.config, "train") if hasattr(_PR, "resolve_split_kind") else str(self.config.get("data_kind", "vector")).lower()
+        return kind.startswith("image")
+
+    def _build_image_loaders(self) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+        if ImageFolderDataset is None:
+            raise RuntimeError("Image support not available; missing image_data module")
+        cfg = self.config
+        train_dir_raw = cfg.get("train_image_dir", None)
+        val_dir_raw = cfg.get("val_image_dir", None)
+        # Anchor paths relative to config
+        base_cfg_path = Path(cfg.get("_config_path", Path(cfg.get("_config_dir", ".")) / "config.json"))
+        resolver = PathResolver(base_cfg_path, outputs_root=str(cfg.get("outputs_root")) if isinstance(cfg.get("outputs_root"), str) else None)
+        train_dir = str(resolver.anchor(train_dir_raw)) if isinstance(train_dir_raw, str) and train_dir_raw.strip() else None
+        val_dir = str(resolver.anchor(val_dir_raw)) if isinstance(val_dir_raw, str) and val_dir_raw.strip() else None
+        # If a container folder was provided (e.g., 'training data'), auto-descend into 'image' if present
+        try:
+            if isinstance(train_dir, str):
+                p = Path(train_dir)
+                if p.exists() and p.is_dir():
+                    cand = p / "image"
+                    if cand.exists() and cand.is_dir():
+                        train_dir = str(cand.resolve())
+        except Exception:
+            pass
+        try:
+            if isinstance(val_dir, str):
+                p = Path(val_dir)
+                if p.exists() and p.is_dir():
+                    cand = p / "image"
+                    if cand.exists() and cand.is_dir():
+                        val_dir = str(cand.resolve())
+        except Exception:
+            pass
+        if not isinstance(train_dir, str) or not train_dir.strip():
+            raise RuntimeError("train_image_dir must be set for image training")
+        image_size = tuple(cfg.get("image_size", [256, 256]))
+        channels = int(cfg.get("image_channels", 3))
+        mean = cfg.get("image_mean", [0.5])
+        std = cfg.get("image_std", [0.5])
+        augment = cfg.get("augment", None)
+        class_names = cfg.get("class_names", None)
+
+        batch_size = int(cfg.get("batch_size", 16))
+        num_workers = int(cfg.get("num_workers", 0))
+        pin_memory = bool(cfg.get("pin_memory", False))
+
+        if isinstance(val_dir, str) and val_dir.strip():
+            ds_train = ImageFolderDataset(train_dir, image_size=image_size, channels=channels, mean=mean, std=std, augment=augment, class_names=class_names)
+            ds_val = ImageFolderDataset(val_dir, image_size=image_size, channels=channels, mean=mean, std=std, augment=None, class_names=class_names)
+        else:
+            # Split within train dir
+            ds_all = ImageFolderDataset(train_dir, image_size=image_size, channels=channels, mean=mean, std=std, augment=augment, class_names=class_names)
+            # Deterministic split via indices
+            n = len(ds_all)
+            val_split = float(cfg.get("val_split", 0.2))
+            val_split = min(max(val_split, 0.0), 0.9)
+            n_val = int(round(n * val_split))
+            n_train = max(0, n - n_val)
+            idx = np.arange(n)
+            rng = np.random.default_rng(int(cfg.get("seed", 42)))
+            rng.shuffle(idx)
+            val_idx = idx[:n_val]
+            tr_idx = idx[n_val:]
+            self.console.info(f"[split] image dataset using val_split={val_split:.2f} -> train={n_train}, val={n_val}")
+            ds_train = torch.utils.data.Subset(ds_all, tr_idx.tolist())
+            ds_val = torch.utils.data.Subset(ds_all, val_idx.tolist())
+
+        train_loader = torch.utils.data.DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+        val_loader = torch.utils.data.DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+        return train_loader, val_loader
+
+    def compute_and_lock_tiling(self, lock: bool = True) -> Tuple[int, int, int, int] | None:
+        """Compute adaptive tile_size and stride from the smallest training source.
+
+        Returns (tile_h, tile_w, stride_h, stride_w) for vector mode; returns None for image mode.
+        """
+        if self._is_image_mode():
+            return None
+
+        # Resolve training list from config
+        train_field_cfg = self.config.get("train_field_path", self.config.get("field_path", ""))
+        if isinstance(train_field_cfg, (list, tuple)):
+            train_list = [str(p) for p in train_field_cfg]
+        else:
+            train_field = str(train_field_cfg or "")
+            if ";" in train_field or "," in train_field:
+                train_list = [s.strip() for s in train_field.replace(";", ",").split(",") if s.strip()]
+            else:
+                train_list = [train_field] if train_field else []
+        if not train_list:
+            raise RuntimeError("'train_field_path' or 'field_path' is required to compute tiling")
+
+        resolver = PathResolver(
+            Path(self.config.get("_config_path", Path(self.config.get("_config_dir", ".")) / "config.json")),
+            outputs_root=str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None,
+        )
+        patterns = ["*.csv", "*.npy", "*.npz"]
+        inspect_paths: List[Path] = []
+        for s in train_list:
+            if not s:
+                continue
+            try:
+                p = Path(s)
+                looks_like_dir = (not p.suffix) or any(ch in str(p) for ch in ("*", "?", "["))
+                if looks_like_dir:
+                    expanded = resolver.expand_fields([s], recurse=True, patterns=patterns)
+                    for e in expanded:
+                        pe = Path(e)
+                        if pe.is_file():
+                            inspect_paths.append(pe)
+                else:
+                    if not p.is_absolute():
+                        p = (Path(self.config.get("_config_dir", ".")) / p).resolve()
+                    if p.is_file():
+                        inspect_paths.append(p)
+            except Exception:
+                continue
+
+        # Filter inspect_paths to likely vector field files (skip mapping CSVs)
+        def _is_vector_candidate(pp: Path) -> bool:
+            ext = pp.suffix.lower()
+            if ext in (".npy", ".npz"):
+                return True
+            if ext == ".csv":
+                try:
+                    with pp.open("r", encoding="utf-8", errors="ignore") as f:
+                        first = f.readline().lower()
+                    if ("file_name" in first and "label" in first):
+                        return False
+                    return any(k in first for k in ("x", "y", "delta", "dx", "dy"))
+                except Exception:
+                    return False
+            return False
+
+        inspect_paths = [p for p in inspect_paths if _is_vector_candidate(p)]
+        if not inspect_paths:
+            raise RuntimeError("No training files found to compute tiling")
+
+        min_H, min_W = None, None
+        for p in inspect_paths:
+            arr = load_vector_field(str(p))
+            chw = ensure_chw(arr)
+            H, W = int(chw.shape[1]), int(chw.shape[2])
+            min_H = H if min_H is None else min(min_H, H)
+            min_W = W if min_W is None else min(min_W, W)
+
+        desired_th, desired_tw = tuple(self.config.get("tile_size", [256, 256]))
+        stride_cfg = self.config.get("tile_stride", None)
+        if isinstance(stride_cfg, (list, tuple)):
+            sh, sw = int(stride_cfg[0]), int(stride_cfg[1])
+        else:
+            sh, sw = int(desired_th), int(desired_tw)
+
+        cnn_min = self._cnn_min_side()
+        pre_th = max(1, min(int(desired_th), int(min_H or desired_th)))
+        pre_tw = max(1, min(int(desired_tw), int(min_W or desired_tw)))
+        safe_th = max(cnn_min, pre_th)
+        safe_tw = max(cnn_min, pre_tw)
+        safe_sh = max(1, min(int(sh), safe_th))
+        safe_sw = max(1, min(int(sw), safe_tw))
+
+        if lock:
+            # Stash diagnostics for UI/summary tables
+            try:
+                if min_H is not None and min_W is not None:
+                    self.config["_tiling_min_source_hw"] = [int(min_H), int(min_W)]
+                self.config["_tiling_cnn_min_side"] = int(cnn_min)
+            except Exception:
+                pass
+            self.config["tile_size"] = [int(safe_th), int(safe_tw)]
+            self.config["tile_stride"] = [int(safe_sh), int(safe_sw)]
+            self._tiling_locked = True
+            self.console.info(
+                f"[tiling] Global tile_size=({safe_th},{safe_tw}) stride=({safe_sh},{safe_sw}) from smallest training source across {len(inspect_paths)} source(s)"
+            )
+        return int(safe_th), int(safe_tw), int(safe_sh), int(safe_sw)
+
     def _load_split(self, *, field_path: str, split: str) -> Tuple[np.ndarray, np.ndarray]:
         """
         Load tiles and labels for a split. Supports:
@@ -121,14 +322,98 @@ class Trainer:
         if not paths:
             raise RuntimeError("field_path must be a non-empty string or list of strings")
 
-        # Anchor all paths relative to config dir
-        base_dir = Path(self.config.get("_config_dir", "."))
-        abs_paths: List[Path] = []
+        # Expand any directories based on data kind and file type patterns using PathResolver
+        cfg_path_str = str(self.config.get("_config_path", Path(self.config.get("_config_dir", ".")) / "config.json"))
+        try:
+            cfg_path = Path(cfg_path_str)
+        except Exception:
+            cfg_path = Path(self.config.get("_config_dir", ".")) / "config.json"
+        resolver = PathResolver(cfg_path, outputs_root=str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None)
+
+        # Determine data kind and patterns
+        data_kind_key = f"{split}_data_kind"
+        data_kind = (self.config.get(data_kind_key) or self.config.get("data_kind") or "vector").strip().lower()
+        if data_kind not in ("vector", "image", "video"):
+            self.console.warn(f"Unknown data kind '{data_kind}'; defaulting to 'vector'")
+            data_kind = "vector"
+        if data_kind == "vector":
+            patterns = ["*.csv", "*.npy", "*.npz"]
+        elif data_kind == "image":
+            patterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff"]
+        else:  # video
+            patterns = ["*.mp4", "*.avi", "*.mov", "*.mkv"]
+
+        # If user gave base directories, optionally append the data_kind subfolder
+        inputs_for_expand: List[str] = []
         for p in paths:
-            pp = Path(p)
-            if not pp.is_absolute():
-                pp = (base_dir / pp).resolve()
-            abs_paths.append(pp)
+            ps = str(p)
+            q = Path(ps)
+            if q.suffix == "":
+                # Likely a directory; if so, consider subfolder by data_kind variations
+                try:
+                    base = q if q.is_absolute() else (Path(self.config.get("_config_dir", ".")) / q).resolve()
+                    candidates = [base / data_kind, base / f"{data_kind} data", base / f"{data_kind}s"]
+                    chosen = None
+                    for cand in candidates:
+                        if cand.exists() and cand.is_dir():
+                            chosen = cand
+                            break
+                    inputs_for_expand.append(str(chosen if chosen is not None else base))
+                except Exception:
+                    inputs_for_expand.append(ps)
+            else:
+                inputs_for_expand.append(ps)
+
+        expanded = resolver.expand_fields(inputs_for_expand, recurse=True, patterns=patterns)
+        if not expanded:
+            # Fallback to anchoring raw paths
+            base_dir = Path(self.config.get("_config_dir", "."))
+            abs_paths: List[Path] = []
+            for p in paths:
+                pp = Path(p)
+                if not pp.is_absolute():
+                    pp = (base_dir / pp).resolve()
+                abs_paths.append(pp)
+        else:
+            abs_paths = [Path(s) for s in expanded]
+
+        # Guard: current training pipeline supports only vector fields (CSV/NPY/NPZ)
+        if data_kind != "vector":
+            raise RuntimeError(
+                f"Training data_kind='{data_kind}' is not supported by the current vector-field CNN pipeline. "
+                "Use data_kind='vector' or extend loaders to handle images/videos."
+            )
+
+        # Filter expanded paths to likely vector field inputs; skip mapping CSVs like file_name,label
+        def _is_vector_candidate(pp: Path) -> bool:
+            ext = pp.suffix.lower()
+            if ext in (".npy", ".npz"):
+                return True
+            if ext == ".csv":
+                try:
+                    with pp.open("r", encoding="utf-8", errors="ignore") as f:
+                        first = f.readline().lower()
+                    if ("file_name" in first and "label" in first):
+                        return False
+                    return any(k in first for k in ("x", "y", "delta", "dx", "dy"))
+                except Exception:
+                    return False
+            return False
+
+        abs_paths = [pp for pp in abs_paths if pp.is_file() and _is_vector_candidate(pp)]
+
+        # Filter to files only; fail early with a clear message if none found
+        only_files = [pp for pp in abs_paths if pp.is_file()]
+        if not only_files:
+            examples = ", ".join(str(p) for p in abs_paths[:3]) if abs_paths else "<none>"
+            patt_desc = ",".join(patterns)
+            raise RuntimeError(
+                f"No training data files found for split '{split}'. Searched under: {examples} (recurse=True) "
+                f"with patterns [{patt_desc}] and data_kind='{data_kind}'. "
+                f"If you changed folder structure, set train_field_path to the specific subfolder (e.g., '.../vector data')."
+            )
+
+        abs_paths = only_files
 
         # Determine tiling to use
         if getattr(self, "_tiling_locked", False):
@@ -153,8 +438,16 @@ class Trainer:
                     raise RuntimeError(f"Failed to inspect field size for '{pp}': {e}")
 
             desired_th, desired_tw = int(tile_size_cfg[0]), int(tile_size_cfg[1])
-            safe_th = max(1, min(desired_th, int(min_H or desired_th)))
-            safe_tw = max(1, min(desired_tw, int(min_W or desired_tw)))
+            # Cap by smallest provided training source; enforce CNN pooling minimum
+            cnn_min = self._cnn_min_side()
+            pre_th = max(1, min(desired_th, int(min_H or desired_th)))
+            pre_tw = max(1, min(desired_tw, int(min_W or desired_tw)))
+            safe_th = max(cnn_min, pre_th)
+            safe_tw = max(cnn_min, pre_tw)
+            if (min_H is not None and min_H < cnn_min) or (min_W is not None and min_W < cnn_min):
+                self.console.warn(
+                    f"[tiling] Smallest source ({min_H}x{min_W}) is below CNN min side {cnn_min} derived from pooling; proceeding with side=min(source,requested)."
+                )
             if stride_cfg_tuple is None:
                 safe_stride = (safe_th, safe_tw)
             else:
@@ -176,15 +469,53 @@ class Trainer:
         src_labels = self.config.get(src_labels_key, None)
         if src_labels is None:
             src_labels = self.config.get("source_labels", None)
-        if isinstance(src_labels, (list, tuple)) and len(src_labels) != len(paths):
+        # Note: after directory expansion, abs_paths may be larger than 'paths'.
+        # Only use src_labels if it matches abs_paths length exactly; otherwise we'll try auto-infer from filename.
+        if isinstance(src_labels, (list, tuple)):
+            try:
+                src_labels = [int(v) for v in src_labels]
+            except Exception:
+                src_labels = None
+        if isinstance(src_labels, list) and len(src_labels) not in (len(paths), len(abs_paths)):
             self.console.warn(
-                f"{src_labels_key if f'{split}_source_labels' in self.config else 'source_labels'} length {len(src_labels)} doesn't match number of paths {len(paths)}; ignoring"
+                f"{src_labels_key if f'{split}_source_labels' in self.config else 'source_labels'} length {len(src_labels)} does not match number of inputs (paths={len(paths)} expanded={len(abs_paths)}); will auto-infer by filename when possible"
             )
             src_labels = None
 
+        # Decide a per-source cap to avoid starving later sources when limit_tiles is set
+        if limit_tiles is None:
+            per_source_cap: int | None = None
+        else:
+            try:
+                total_cap = int(limit_tiles)
+            except Exception:
+                total_cap = None  # type: ignore[assignment]
+            if total_cap is None or total_cap <= 0:
+                per_source_cap = None
+            else:
+                num_sources = max(1, len(abs_paths))
+                # Even split across sources; at least 1 tile per source when possible
+                per_source_cap = max(1, total_cap // num_sources)
+
         for idx_p, pp in enumerate(abs_paths):
-            used_limit = None if limit_tiles is None else int(max(0, limit_tiles - sum(x.shape[0] for x in X_list)))
-            if isinstance(src_labels, (list, tuple)):
+            used_limit = None if per_source_cap is None else int(per_source_cap)
+            # Decide uniform label for this path (priority: exact per-file src_labels -> auto-infer from name)
+            label_for_this_path: int | None = None
+            if isinstance(src_labels, list) and len(src_labels) == len(abs_paths):
+                try:
+                    label_for_this_path = int(src_labels[idx_p])
+                except Exception:
+                    label_for_this_path = None
+            else:
+                name_l = str(pp).lower()
+                # Map to raw labels 1/2 so that after normalization (y-1),
+                # 0 -> turbulent, 1 -> laminar to match class_names ["turbulent","laminar"].
+                if "turbulent" in name_l:
+                    label_for_this_path = 1  # raw 1 -> index 0 (turbulent)
+                elif "laminar" in name_l:
+                    label_for_this_path = 2  # raw 2 -> index 1 (laminar)
+
+            if label_for_this_path is not None:
                 # Use uniform label per source based on config list
                 Xp = load_vector_field_tiles(
                     path=str(pp),
@@ -194,7 +525,7 @@ class Trainer:
                     normalize=normalize,
                     limit_tiles=used_limit,
                 )
-                lbl = int(src_labels[idx_p])
+                lbl = int(label_for_this_path)
                 yp = np.full((Xp.shape[0],), lbl, dtype=np.int64)
             else:
                 # Prefer embedded labels when available
@@ -222,6 +553,7 @@ class Trainer:
                     yp = _prepare_labels(n=Xp.shape[0], config=self.config, split=split)
             X_list.append(Xp)
             y_list.append(yp)
+            # Respect an overall cap if provided, even with per-source caps
             if limit_tiles is not None and sum(x.shape[0] for x in X_list) >= int(limit_tiles):
                 break
 
@@ -234,6 +566,20 @@ class Trainer:
         if y.size > 0:
             if y.min() >= 1 and y.max() <= 2 and int(self.config.get("num_classes", 2)) == 2:
                 y = (y - 1).astype(np.int64)
+        # Class balance sanity check (warn if only one class present)
+        try:
+            classes, counts = np.unique(y, return_counts=True)
+            if classes.size < int(self.config.get("num_classes", 2)):
+                self.console.warn(
+                    f"Training split '{split}' contains only classes {classes.tolist()} after sampling. "
+                    "Consider increasing or removing limit_tiles or balancing sources."
+                )
+            else:
+                # Light info to help diagnose imbalance without being too verbose
+                hist = ", ".join([f"c{int(c)}={int(n)}" for c, n in zip(classes, counts)])
+                self.console.info(f"[class-balance] {split}: {hist}")
+        except Exception:
+            pass
         return X, y
 
     def _train_one_epoch(self, loader: torch.utils.data.DataLoader, epoch: int) -> Tuple[float, float]:
@@ -278,6 +624,35 @@ class Trainer:
         return avg_loss, acc
 
     def fit(self) -> Path:
+        # Image-mode short-circuit: use folder-based datasets and reuse training loop
+        if self._is_image_mode():
+            train_loader, val_loader = self._build_image_loaders()
+            max_epochs = int(self.config.get("max_epochs", 50))
+            best_val_acc = -1.0
+            best_path: Path | None = None
+            save_path = self._resolve_save_path()
+            for epoch in range(1, max_epochs + 1):
+                tr_loss, tr_acc = self._train_one_epoch(train_loader, epoch)
+                va_loss, va_acc = self._eval(val_loader)
+                self.console.info(
+                    f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f}"
+                )
+                warm = getattr(self.optimizer, "_warmup_scheduler", None)
+                warm_epochs = int(getattr(self.optimizer, "_warmup_epochs", 0))
+                if warm is not None and epoch <= warm_epochs:
+                    warm.step()
+                if self.scheduler is not None and self.scheduler_step_on == "epoch":
+                    if hasattr(self.scheduler, "step"):
+                        if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
+                            self.scheduler.step(va_loss)  # type: ignore[arg-type]
+                        else:
+                            self.scheduler.step()  # type: ignore[misc]
+                if va_acc > best_val_acc:
+                    best_val_acc = va_acc
+                    best_path = self._save_checkpoint(path=save_path, tag="best")
+            final_path = self._save_checkpoint(path=save_path, tag="final")
+            return best_path or final_path
+
         # Resolve training/validation fields
         train_field_cfg = self.config.get("train_field_path", self.config.get("field_path", ""))
         # Allow list of paths or delimited string
@@ -304,17 +679,51 @@ class Trainer:
                 val_list = [val_field] if val_field else []
 
         # Compute single global tiling across train+val and lock it
-        base_dir = Path(self.config.get("_config_dir", "."))
+        # Expand any directories/globs to actual vector files to avoid opening directories
+        resolver = PathResolver(
+            Path(self.config.get("_config_path", Path(self.config.get("_config_dir", ".")) / "config.json")),
+            outputs_root=str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None,
+        )
+        patterns = ["*.csv", "*.npy", "*.npz"]
         inspect_paths: List[Path] = []
-        for s in train_list + val_list:
+        for s in train_list:
             if not s:
                 continue
-            p = Path(s)
-            if not p.is_absolute():
-                p = (base_dir / p).resolve()
-            inspect_paths.append(p)
+            try:
+                p = Path(s)
+                looks_like_dir = (not p.suffix) or any(ch in str(p) for ch in ("*", "?", "["))
+                if looks_like_dir:
+                    expanded = resolver.expand_fields([s], recurse=True, patterns=patterns)
+                    for e in expanded:
+                        pe = Path(e)
+                        if pe.is_file():
+                            inspect_paths.append(pe)
+                else:
+                    if not p.is_absolute():
+                        p = (Path(self.config.get("_config_dir", ".")) / p).resolve()
+                    if p.is_file():
+                        inspect_paths.append(p)
+            except Exception:
+                continue
         if inspect_paths:
             min_H, min_W = None, None
+            # Filter inspect_paths to likely vector field files (skip mapping CSVs)
+            def _is_vector_candidate(pp: Path) -> bool:
+                ext = pp.suffix.lower()
+                if ext in (".npy", ".npz"):
+                    return True
+                if ext == ".csv":
+                    try:
+                        with pp.open("r", encoding="utf-8", errors="ignore") as f:
+                            first = f.readline().lower()
+                        if ("file_name" in first and "label" in first):
+                            return False
+                        return any(k in first for k in ("x", "y", "delta", "dx", "dy"))
+                    except Exception:
+                        return False
+                return False
+
+            inspect_paths = [p for p in inspect_paths if _is_vector_candidate(p)]
             for p in inspect_paths:
                 try:
                     arr = load_vector_field(str(p))
@@ -331,8 +740,16 @@ class Trainer:
                 sh, sw = int(stride_cfg[0]), int(stride_cfg[1])
             else:
                 sh, sw = int(desired_th), int(desired_tw)
-            safe_th = max(1, min(int(desired_th), int(min_H or desired_th)))
-            safe_tw = max(1, min(int(desired_tw), int(min_W or desired_tw)))
+            # Cap by smallest provided training/validation source; enforce CNN pooling minimum
+            cnn_min = self._cnn_min_side()
+            pre_th = max(1, min(int(desired_th), int(min_H or desired_th)))
+            pre_tw = max(1, min(int(desired_tw), int(min_W or desired_tw)))
+            safe_th = max(cnn_min, pre_th)
+            safe_tw = max(cnn_min, pre_tw)
+            if (min_H is not None and min_H < cnn_min) or (min_W is not None and min_W < cnn_min):
+                self.console.warn(
+                    f"[tiling] Smallest source ({min_H}x{min_W}) is below CNN min side {cnn_min} derived from pooling; proceeding with side=min(source,requested)."
+                )
             safe_sh = max(1, min(int(sh), safe_th))
             safe_sw = max(1, min(int(sw), safe_tw))
 
@@ -340,7 +757,7 @@ class Trainer:
             self.config["tile_stride"] = [int(safe_sh), int(safe_sw)]
             self._tiling_locked = True
             self.console.info(
-                f"[tiling] Global tile_size=({safe_th},{safe_tw}) stride=({safe_sh},{safe_sw}) across {len(inspect_paths)} source(s)"
+                f"[tiling] Global tile_size=({safe_th},{safe_tw}) stride=({safe_sh},{safe_sw}) from smallest training source across {len(inspect_paths)} source(s)"
             )
 
         # Load tiles + labels

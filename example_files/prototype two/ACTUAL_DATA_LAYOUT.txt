@@ -1,0 +1,37 @@
+Actual Data Folder Layout (generated snapshot)
+
+Base: example_files/prototype two/data
+
+data/
+├─ training data/
+│  ├─ image/   (present)
+│  ├─ vector/  (present)
+│  └─ video/   (present)
+│
+├─ testing data/
+│  ├─ image/
+│  │  ├─ laminar/    (25 files total)
+│  │  │   └─ subset_1/  e.g., frame0000_mask.png, frame0001_mask.png, frame0002_mask.png
+│  │  ├─ turbulent/  (25 files total)
+│  │  │   └─ (similar PNG masks)
+│  │  └─ mixed/      (114,202 files total)
+│  │      └─ (mask frames spread across subfolders)
+│  │
+│  ├─ file_name.csv                     (present)
+│  ├─ laminar sparse_flow_vectors.csv   (present)
+│  └─ turbulent sparse_flow_vectors.csv (present)
+│
+├─ outputs/
+│  └─ image/
+│     ├─ file_predictions.csv    (present)
+│     ├─ laminar/                (dir present)
+│     ├─ turbulent/              (dir present)
+│     └─ plots/                  (dir present)
+│
+└─ sparse_flow_vectors.zip (present)
+
+Notes
+- Image testing classes discovered: laminar (25), turbulent (25), mixed (114,202).
+- laminar has a subset_1/ folder with PNG masks; discovery uses recursive scan so these are included.
+- outputs/image currently contains per-file predictions and class folders; additional artifacts (CMs/plots) appear there when produced.
+- All paths are anchored relative to this prototype’s config directory.

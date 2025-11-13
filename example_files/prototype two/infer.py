@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import torch
+import time
 import numpy as np
 
 # Ensure local imports work whether run or imported
@@ -27,6 +28,10 @@ from common import HeatmapGenerator
 from heatmap_viewer import show_stitched_heatmap
     # labels loader available in common.load_labels_from_csv
 from console import console_from_config
+try:
+    from image_data import build_class_index as _build_class_index
+except Exception:
+    _build_class_index = None  # type: ignore
 
 
 ## Config loading and device selection are consolidated in common.ConfigManager and DeviceSelector
@@ -90,10 +95,17 @@ def run_inference(
     cm_png_out: Path | None = None,
     show_heatmap: bool = False,
     file_summary_out: Path | None = None,
+    report_list: "list[tuple[str, str, int, float]] | None" = None,
+    report_probs_list: "list[tuple[str, list[float]]] | None" = None,
 ) -> "np.ndarray | None":
     c = console_from_config(config)
-    tile_size = tuple(config.get("tile_size", [256, 256]))
-    stride_cfg = config.get("tile_stride", None)
+    # Ensure return variable is always defined
+    cm: np.ndarray | None = None
+    # Allow inference-specific overrides for tiling
+    inf_ts = config.get("inference_tile_size", None)
+    inf_tr = config.get("inference_tile_stride", None)
+    tile_size = tuple(inf_ts if isinstance(inf_ts, (list, tuple)) else config.get("tile_size", [256, 256]))
+    stride_cfg = inf_tr if isinstance(inf_tr, (list, tuple)) else config.get("tile_stride", None)
     stride: Tuple[int, int] | None = None
     if isinstance(stride_cfg, (list, tuple)):
         stride = (int(stride_cfg[0]), int(stride_cfg[1]))
@@ -147,11 +159,17 @@ def run_inference(
     with torch.no_grad():
         x = torch.from_numpy(tile_batch).to(device)
         logits = model(x)
-        probs = torch.softmax(logits, dim=1)
+        # Support both single-logit binary and multi-class heads
+        if logits.ndim == 2 and logits.shape[1] == 1:
+            p1 = torch.sigmoid(logits.squeeze(1))  # (N,)
+            # Synthesize two-class probabilities [P(class0), P(class1)]
+            probs = torch.stack([1.0 - p1, p1], dim=1)  # (N, 2)
+        else:
+            probs = torch.softmax(logits, dim=1)
         conf, pred = torch.max(probs, dim=1)
 
     # Summaries
-    c.info(f"Logits shape: {tuple(logits.shape)} | num_classes={logits.shape[1]}")
+    c.info(f"Logits shape: {tuple(logits.shape)} | num_classes={probs.shape[1]}")
     topk = min(5, logits.shape[0])
     c.debug("Sample predictions (first N tiles):")
     for i in range(topk):
@@ -242,14 +260,24 @@ def run_inference(
         file_conf = float(probs_mean[file_pred_idx])
         # Choose class names from provided list or from config
         names = None
-        if class_names and len(class_names) == int(logits.shape[1]):
+        if class_names and len(class_names) == int(probs.shape[1]):
             names = class_names
         else:
             cfg_names = config.get("class_names", None)
-            if isinstance(cfg_names, list) and len(cfg_names) == int(logits.shape[1]):
+            if isinstance(cfg_names, list) and len(cfg_names) == int(probs.shape[1]):
                 names = [str(s) for s in cfg_names]
         pred_name = names[file_pred_idx] if names is not None else f"class{file_pred_idx}"
         fname = Path(field_path).name
+        # Append to in-memory report lists for terminal tables
+        try:
+            if report_list is not None:
+                report_list.append((fname, pred_name, int(file_pred_idx), float(round(file_conf * 100.0, 2))))
+            if report_probs_list is not None:
+                # Store mean probs as a Python list for table printing
+                report_probs_list.append((fname, [float(x) for x in probs_mean.tolist()]))
+        except Exception:
+            pass
+
         if file_summary_out is not None:
             try:
                 file_summary_out.parent.mkdir(parents=True, exist_ok=True)
@@ -404,6 +432,17 @@ def run_inference(
             # Save CSV/PNG/TXT via common helper
             save_confusion_outputs(cm, class_names, cm_csv_out, cm_png_out, console=c)
 
+            # Print confusion matrix as a console table (counts)
+            try:
+                names = class_names if isinstance(class_names, list) and class_names else [str(i) for i in range(int(cm.shape[0]))]
+                headers = ["true\\pred"] + names
+                rows = []
+                for i, tn in enumerate(names):
+                    rows.append([tn] + [str(int(cm[i, j])) for j in range(len(names))])
+                c.table(headers, rows, align=["l"] + ["r"] * len(names), title="Confusion Matrix (counts)")
+            except Exception:
+                pass
+
             # Print simple tile-level accuracy if any labels present
             total = int(cm.sum())
             correct = int(np.trace(cm)) if cm.size > 0 else 0
@@ -411,7 +450,659 @@ def run_inference(
                 acc = correct / total
                 c.info(f"Tile accuracy: {acc*100.0:.2f}% ({correct}/{total})")
 
-            return cm
+    return cm
+
+
+def _load_single_image(path: Path, *, image_size: Tuple[int, int], channels: int, mean: list[float], std: list[float], use_cv: bool = False) -> torch.Tensor:
+    # Lightweight duplicate of image_data loader to avoid heavy imports
+    if use_cv:
+        try:
+            import cv2  # type: ignore
+            img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise RuntimeError("cv2.imread returned None")
+            if channels == 1:
+                if img.ndim == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                else:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (int(image_size[1]), int(image_size[0])), interpolation=cv2.INTER_AREA)
+            arr = img
+            if channels == 1:
+                arr = np.expand_dims(arr, axis=0)
+            else:
+                arr = np.transpose(arr, (2, 0, 1))
+            arr = arr.astype(np.float32) / 255.0
+        except Exception:
+            use_cv = False
+    if not use_cv:
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("Pillow (PIL) is required for image inference. Install 'Pillow'.") from e
+        with Image.open(path) as img:
+            if channels == 1:
+                img = img.convert("L")
+            else:
+                img = img.convert("RGB")
+            img = img.resize((int(image_size[1]), int(image_size[0])), resample=Image.BILINEAR)
+            arr = np.array(img)
+            if channels == 1:
+                arr = np.expand_dims(arr, axis=0)
+            else:
+                arr = np.transpose(arr, (2, 0, 1))
+            arr = arr.astype(np.float32) / 255.0
+        # normalize
+        c = arr.shape[0]
+        # Validate lengths; allow single-value broadcast or exact match
+        if len(mean) not in (1, c) or len(std) not in (1, c):
+            raise RuntimeError("image mean/std length must be 1 or match channels")
+        if len(mean) == 1:
+            mean = [float(mean[0])] * c
+        if len(std) == 1:
+            std = [float(std[0])] * c
+        for i in range(c):
+            arr[i] = (arr[i] - float(mean[i])) / (float(std[i]) + 1e-6)
+        return torch.from_numpy(arr.astype(np.float32))
+
+
+def run_image_inference(
+    *,
+    config: Dict[str, Any],
+    device: torch.device,
+    model: torch.nn.Module,
+    image_root: str,
+    base_outputs: Path | None = None,
+    file_summary_out: Path | None = None,
+    cm_csv_out: Path | None = None,
+    cm_png_out: Path | None = None,
+    include_classes: "list[str] | None" = None,
+    out_subdir: str | None = None,
+) -> None:
+    c = console_from_config(config)
+    root = Path(image_root)
+    if not root.exists():
+        c.warn(f"Image root not found: {root}; skipping inference for this path.")
+        return
+    size = tuple(config.get("image_size", [256, 256]))  # type: ignore[assignment]
+    channels = int(config.get("image_channels", 3))
+    mean = list(config.get("image_mean", [0.5]))
+    std = list(config.get("image_std", [0.5]))
+    class_names = config.get("class_names", None)
+    # Build mapping from subfolders if not provided
+    if _build_class_index is not None:
+        try:
+            mapping = _build_class_index(root, class_names)
+        except Exception:
+            mapping = None
+    else:
+        mapping = None
+    idx_to_name = None
+    if mapping:
+        idx_to_name = {v: k for k, v in mapping.items()}
+
+    # Collect images under subfolders
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    all_files: list[Path]
+    # Optimization: when include_classes is provided, scan only those class folders directly under root
+    if include_classes:
+        try:
+            allow_set = {str(x).lower() for x in include_classes}
+            all_files = []
+            # Show a transient scan bar while enumerating many files
+            try:
+                from tqdm import tqdm as _tqdm  # type: ignore
+                scan_bar = _tqdm(desc="scan", unit="file", dynamic_ncols=True, ascii=True, leave=False)
+            except Exception:
+                scan_bar = None
+            for cls in sorted(allow_set):
+                cls_dir = (root / cls)
+                if not (cls_dir.exists() and cls_dir.is_dir()):
+                    continue
+                try:
+                    for p in cls_dir.rglob("*"):
+                        if p.is_file() and p.suffix.lower() in exts:
+                            all_files.append(p)
+                            if scan_bar is not None:
+                                try:
+                                    scan_bar.update(1)
+                                except Exception:
+                                    pass
+                except Exception:
+                    continue
+            try:
+                if scan_bar is not None:
+                    scan_bar.close()
+            except Exception:
+                pass
+            try:
+                c.info(f"Restricted scan to classes: {', '.join(sorted(allow_set))} (files found={len(all_files)})")
+            except Exception:
+                pass
+        except Exception:
+            all_files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+    else:
+        all_files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+    def _nearest_class_name(p: Path) -> str | None:
+        try:
+            for ancestor in [p.parent] + list(p.parents):
+                if ancestor.resolve() == root.resolve():
+                    break
+                nm = ancestor.name
+                if mapping and nm in mapping:
+                    return nm
+        except Exception:
+            return None
+        return None
+    if include_classes is not None and len(include_classes) > 0:
+        allow = {str(x).lower() for x in include_classes}
+        files = []
+        for p in all_files:
+            # Derive nearest class using include list (ignore mapping)
+            nm = None
+            try:
+                for ancestor in [p.parent] + list(p.parents):
+                    if ancestor.resolve() == root.resolve():
+                        break
+                    name_l = ancestor.name.lower()
+                    if name_l in allow:
+                        nm = name_l
+                        break
+            except Exception:
+                nm = None
+            if nm is not None:
+                files.append(p)
+    else:
+        files = all_files
+    if not files:
+        c.warn(f"No images found under {root}; nothing to infer")
+        return
+    # Pre-run sanity: show a quick scan summary and a few sample files
+    try:
+        c.header("Scan")
+        c.info(f"Files queued: {len(files)}")
+        if mapping:
+            # List a few class names in discovery order
+            try:
+                some = ", ".join(list(mapping.keys())[:6])
+                more = " ..." if len(mapping) > 6 else ""
+                c.info(f"Classes: {len(mapping)} -> {some}{more}")
+            except Exception:
+                pass
+        # Show a few samples with nearest class name
+        try:
+            n_show = min(5, len(files))
+            for p in files[:n_show]:
+                nm = _nearest_class_name(p)
+                c.info(f"sample: {p.name}  class={nm if nm is not None else '<unknown>'}")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    model.eval()
+    results: list[tuple[str, str, int, float]] = []
+    # Batched inference for large folders
+    try:
+        bs = int(config.get("image_infer_batch_size", 64))
+    except Exception:
+        bs = 64
+    # Read perf options (accept under top-level or under 'inference')
+    def _opt(key: str, default=None):
+        inf = config.get("inference", {}) if isinstance(config.get("inference"), dict) else {}
+        return config.get(key, inf.get(key, default))
+    mixed_precision = str(_opt("mixed_precision", "off")).lower()
+    use_channels_last = bool(_opt("channels_last", False))
+    prefetch_workers = int(_opt("prefetch_workers", 0) or 0)
+    use_cv = bool(_opt("use_opencv_loader", False))
+    use_pin_memory = bool(_opt("pin_memory", False))
+
+    # Loader availability probe: ensure at least one loader works
+    loader_ok = False
+    if use_cv:
+        try:
+            import cv2  # type: ignore
+            loader_ok = True
+        except Exception:
+            use_cv = False
+    if not loader_ok:
+        try:
+            from PIL import Image  # type: ignore  # noqa: F401
+            loader_ok = True
+        except Exception:
+            loader_ok = False
+    if not loader_ok:
+        raise RuntimeError(
+            "No image loader available. Install Pillow ('pip install Pillow') or enable use_opencv_loader with OpenCV ('pip install opencv-python')."
+        )
+    batch_paths: list[Path] = []
+    batch_tensors: list[torch.Tensor] = []
+    processed_files: list[Path] = []
+
+    # Progress setup
+    total_files = len(files)
+    processed = 0
+    last_print = 0.0
+    # Optional tqdm progress bar (falls back to periodic logs)
+    try:
+        from tqdm import tqdm  # type: ignore
+        # Use conservative redraw settings for Windows consoles; avoid wide glyphs and fit to terminal width
+        bar = tqdm(total=total_files, desc="images", unit="img", dynamic_ncols=True, ascii=True, mininterval=0.1, miniters=1, smoothing=0.0, leave=True)
+    except Exception:
+        bar = None
+    # Print an initial line only when tqdm is not available
+    if bar is None:
+        try:
+            c.info(f"Progress: 0/{total_files} (0.0%)")
+        except Exception:
+            pass
+    # Also emit every 'step' images (~200 updates)
+    step = max(1, max(100, total_files // 200))
+
+    def _flush_batch() -> None:
+        if not batch_tensors:
+            return
+        nonlocal processed, last_print
+        xb = torch.stack(batch_tensors, dim=0)
+        if use_channels_last:
+            try:
+                xb = xb.contiguous(memory_format=torch.channels_last)
+            except Exception:
+                pass
+        if device.type == "cuda" and use_pin_memory:
+            try:
+                xb = xb.pin_memory()
+            except Exception:
+                pass
+        xb = xb.to(device, non_blocking=(device.type == "cuda"))
+        use_inf_mode = bool(_opt("use_inference_mode", True))
+        # Forward under inference_mode (slightly faster than no_grad)
+        ctx = torch.inference_mode if use_inf_mode else torch.no_grad
+        with ctx():
+            if device.type == "cuda" and mixed_precision in ("fp16", "bf16"):
+                try:
+                    dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16
+                    # Use new torch.amp.autocast API to avoid deprecation warnings
+                    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                        logits = model(xb)
+                except Exception:
+                    logits = model(xb)
+            else:
+                logits = model(xb)
+            probs = torch.softmax(logits, dim=1).detach().cpu().numpy()
+        for i, pth in enumerate(batch_paths):
+            prob_i = probs[i]
+            pred_idx = int(np.argmax(prob_i))
+            conf = float(prob_i[pred_idx])
+            pred_name = idx_to_name.get(pred_idx, str(pred_idx)) if idx_to_name is not None else str(pred_idx)
+            results.append((pth.name, pred_name, pred_idx, conf))
+        # Keep results aligned with the exact files we just processed
+        processed_files.extend(list(batch_paths))
+        batch_paths.clear()
+        batch_tensors.clear()
+        # No progress update here; we update per image as they are decoded/queued
+
+    if prefetch_workers > 0:
+        # Threaded per-batch image decode/resize
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            err_counter = {"n": 0}
+            def _load(pth: Path) -> tuple[Path, torch.Tensor | None]:
+                try:
+                    x = _load_single_image(pth, image_size=(int(size[0]), int(size[1])), channels=channels, mean=mean, std=std, use_cv=use_cv)
+                    return (pth, x)
+                except Exception as e:
+                    # Log a few early failures to help diagnose empty outputs
+                    try:
+                        if err_counter["n"] < 5:
+                            err_counter["n"] += 1
+                            c.warn(f"decode failed: {pth.name} -> {e}")
+                    except Exception:
+                        pass
+                    return (pth, None)
+            for i in range(0, len(files), bs):
+                chunk = files[i : i + bs]
+                batch_paths = []
+                batch_tensors = []
+                with ThreadPoolExecutor(max_workers=max(1, prefetch_workers)) as ex:
+                    futs = [ex.submit(_load, p) for p in chunk]
+                    for fu in futs:
+                        pth, x = fu.result()
+                        if x is None:
+                            continue
+                        batch_paths.append(pth)
+                        batch_tensors.append(x)
+                        # Per-image progress update
+                        processed += 1
+                        if bar is not None:
+                            try:
+                                bar.update(1)
+                                # Occasionally force a redraw to keep the bar live even if other logs appear
+                                if processed % step == 0:
+                                    bar.refresh()
+                            except Exception:
+                                pass
+                        now = time.time()
+                        if bar is None and (now - last_print >= 0.5 or (processed % step == 0) or processed >= total_files):
+                            pct = (processed / max(1, total_files)) * 100.0
+                            c.info(f"Progress: {processed}/{total_files} ({pct:.1f}%)")
+                            last_print = now
+                _flush_batch()
+        except Exception:
+            # Fallback to sequential
+            for p in files:
+                try:
+                    x = _load_single_image(p, image_size=(int(size[0]), int(size[1])), channels=channels, mean=mean, std=std, use_cv=use_cv)
+                    batch_paths.append(p)
+                    batch_tensors.append(x)
+                    if len(batch_tensors) >= max(1, bs):
+                        _flush_batch()
+                except Exception:
+                    continue
+                # Per-image progress update (sequential)
+                processed += 1
+                if bar is not None:
+                    try:
+                        bar.update(1)
+                        if processed % step == 0:
+                            bar.refresh()
+                    except Exception:
+                        pass
+                now = time.time()
+                if bar is None and (now - last_print >= 0.5 or (processed % step == 0) or processed >= total_files):
+                    pct = (processed / max(1, total_files)) * 100.0
+                    c.info(f"Progress: {processed}/{total_files} ({pct:.1f}%)")
+                    last_print = now
+            _flush_batch()
+    else:
+        for p in files:
+            try:
+                x = _load_single_image(p, image_size=(int(size[0]), int(size[1])), channels=channels, mean=mean, std=std, use_cv=use_cv)
+                batch_paths.append(p)
+                batch_tensors.append(x)
+                if len(batch_tensors) >= max(1, bs):
+                    _flush_batch()
+            except Exception:
+                # Skip unreadable files but continue
+                continue
+            # Per-image progress update (sequential, no prefetch)
+            processed += 1
+            if bar is not None:
+                try:
+                    bar.update(1)
+                    if processed % step == 0:
+                        bar.refresh()
+                except Exception:
+                    pass
+            now = time.time()
+            if bar is None and (now - last_print >= 0.5 or (processed % step == 0) or processed >= total_files):
+                pct = (processed / max(1, total_files)) * 100.0
+                c.info(f"Progress: {processed}/{total_files} ({pct:.1f}%)")
+                last_print = now
+        _flush_batch()
+    # Final progress line at 100% (only when tqdm is not used)
+    if bar is None:
+        try:
+            pct = (processed / max(1, total_files)) * 100.0
+            if processed >= total_files:
+                c.info(f"Progress: {processed}/{total_files} ({pct:.1f}%)")
+        except Exception:
+            pass
+    # Close bar if used
+    try:
+        if bar is not None:
+            bar.close()
+    except Exception:
+        pass
+    # Decide default image output path under outputs_root/image when not provided
+    if file_summary_out is None:
+        try:
+            if base_outputs is not None:
+                sub = out_subdir if isinstance(out_subdir, str) and out_subdir.strip() else "image"
+                file_summary_out = (base_outputs / sub / "file_predictions.csv").resolve()
+            else:
+                # Fallback to ./data/outputs/image
+                sub = out_subdir if isinstance(out_subdir, str) and out_subdir.strip() else "image"
+                file_summary_out = (Path(".") / "data" / "outputs" / sub / "file_predictions.csv").resolve()
+        except Exception:
+            file_summary_out = None
+
+    # Write summary CSV with required columns only
+    if file_summary_out is not None:
+        try:
+            file_summary_out.parent.mkdir(parents=True, exist_ok=True)
+            import csv
+
+            def _write_csv(path: Path) -> int:
+                with path.open("w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    # Image-only output: name, predicted class, %accuracy (confidence)
+                    w.writerow(["image_name", "predicted_class", "%accuracy"]) 
+                    for (name, pred_name, pred_idx, conf) in results:
+                        w.writerow([name, pred_name, round(conf * 100.0, 2)])
+                return len(results)
+
+            try:
+                nrows = _write_csv(file_summary_out)
+                c.info(f"Wrote image predictions: {file_summary_out} (rows={nrows})")
+            except Exception as e1:
+                # Fallback: write to a timestamped file in same directory
+                try:
+                    from datetime import datetime as _dt
+                    ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+                    alt = file_summary_out.with_name(f"{file_summary_out.stem}-{ts}{file_summary_out.suffix}")
+                    _write_csv(alt)
+                    c.warn(f"Summary file locked ('{file_summary_out}'); wrote to '{alt}' instead.")
+                except Exception as e2:
+                    c.warn(f"Failed to write file summary (fallback also failed): {e2}")
+        except Exception as e:
+            c.warn(f"Failed to prepare summary output directory: {e}")
+    # Optional confusion matrix for images, derived from subfolder names (mapping)
+    try:
+        want_cm = bool(config.get("generate_confusion_matrix", True))
+    except Exception:
+        want_cm = True
+    if mapping and want_cm:
+        # Default CM paths under outputs_root/image when not provided
+        if cm_csv_out is None or cm_png_out is None:
+            try:
+                if base_outputs is not None:
+                    sub = out_subdir if isinstance(out_subdir, str) and out_subdir.strip() else "image"
+                    base_img = (base_outputs / sub).resolve()
+                else:
+                    sub = out_subdir if isinstance(out_subdir, str) and out_subdir.strip() else "image"
+                    base_img = (Path(".") / "data" / "outputs" / sub).resolve()
+                if cm_csv_out is None:
+                    cm_csv_out = base_img / "confusion_matrix.csv"
+                if cm_png_out is None:
+                    cm_png_out = base_img / "confusion_matrix.png"
+            except Exception:
+                pass
+
+        # y_true from directory names; y_pred from model
+        y_true: list[int] = []
+        y_pred: list[int] = []
+        for i, p in enumerate(processed_files):
+            # Walk up to find the nearest ancestor whose name matches a class under root
+            cls_idx = None
+            try:
+                for ancestor in [p.parent] + list(p.parents):
+                    if ancestor == root or root in ancestor.parents or ancestor == p.parent:
+                        name = ancestor.name
+                        if name in mapping:
+                            cls_idx = int(mapping[name])
+                            break
+                        # Stop once we climbed to root
+                        if ancestor.resolve() == root.resolve():
+                            break
+            except Exception:
+                cls_idx = None
+            if cls_idx is not None:
+                y_true.append(cls_idx)
+                y_pred.append(int(results[i][2]))
+        if y_true:
+            y_true_arr = np.asarray(y_true, dtype=np.int64)
+            # y_pred was built in lockstep with processed_files; ensure same length
+            y_pred_arr = np.asarray(y_pred[: len(y_true)], dtype=np.int64)
+            num_classes = int(config.get("num_classes", max(2, len(mapping))))
+            idx = (y_true_arr * num_classes + y_pred_arr).astype(np.int64)
+            cm = np.bincount(idx, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+            from common import save_confusion_outputs
+            try:
+                names = list(mapping.keys())
+                save_confusion_outputs(cm, names, cm_csv_out, cm_png_out, console=c)
+                # Console table (counts)
+                headers = ["true\\pred"] + names
+                rows = []
+                for i, tn in enumerate(names):
+                    rows.append([tn] + [str(int(cm[i, j])) for j in range(len(names))])
+                c.table(headers, rows, align=["l"] + ["r"] * len(names), title="Confusion Matrix (counts)")
+                # Accuracy summary
+                total = int(cm.sum())
+                correct = int(np.trace(cm)) if cm.size > 0 else 0
+                if total > 0:
+                    acc = (correct / total) * 100.0
+                    c.info(f"Image accuracy: {correct}/{total} ({acc:.2f}%)")
+            except Exception as e:
+                c.warn(f"Failed to save/print image confusion matrix: {e}")
+
+        # Per-folder confusion matrices and distributions
+        try:
+            # Base folder for per-class artifacts
+            if base_outputs is not None:
+                sub = out_subdir if isinstance(out_subdir, str) and out_subdir.strip() else "image"
+                base_img = (base_outputs / sub).resolve()
+            else:
+                sub = out_subdir if isinstance(out_subdir, str) and out_subdir.strip() else "image"
+                base_img = (Path(".") / "data" / "outputs" / sub).resolve()
+
+            # Helper to find nearest class folder name
+            def _nearest_cls_for(p: Path) -> str | None:
+                try:
+                    for anc in [p.parent] + list(p.parents):
+                        if anc.resolve() == root.resolve():
+                            break
+                        nm = anc.name
+                        if nm in mapping:
+                            return nm
+                except Exception:
+                    return None
+                return None
+
+            # Determine number of output classes from model/config
+            try:
+                num_out = int(getattr(model, "num_classes", config.get("num_classes", len(mapping))))
+            except Exception:
+                num_out = max(2, len(mapping))
+
+            names = list(mapping.keys())
+            for cls_name in names:
+                cls_dir = (base_img / cls_name).resolve()
+                cls_dir.mkdir(parents=True, exist_ok=True)
+                # Collect subset indices belonging to this folder
+                idxs: list[int] = []
+                for i, p in enumerate(processed_files):
+                    nm = _nearest_cls_for(p)
+                    if nm == cls_name:
+                        idxs.append(i)
+                if not idxs:
+                    continue
+                # Build CM for laminar/turbulent folders when model has 2 classes
+                if cls_name.lower() in ("laminar", "turbulent") and num_out == 2:
+                    try:
+                        true_idx = int(mapping[cls_name])
+                        y_true_cls = np.full((len(idxs),), true_idx, dtype=np.int64)
+                        y_pred_cls = np.asarray([int(results[i][2]) for i in idxs], dtype=np.int64)
+                        idx = (y_true_cls * num_out + y_pred_cls).astype(np.int64)
+                        cm_cls = np.bincount(idx, minlength=num_out * num_out).reshape(num_out, num_out)
+                        from common import save_confusion_outputs as _save_cm
+                        csv_p = cls_dir / f"cm-{cls_name}.csv"
+                        png_p = cls_dir / f"cm-{cls_name}.png"
+                        _save_cm(cm_cls, names if len(names) == num_out else [str(i) for i in range(num_out)], csv_p, png_p, console=c)
+                        c.info(f"Saved per-folder CM for {cls_name}: {csv_p}")
+                    except Exception as e:
+                        c.warn(f"Failed per-folder CM for {cls_name}: {e}")
+                else:
+                    # For folders not matching model classes (e.g., 'mixed'), save prediction distribution
+                    try:
+                        counts = np.zeros((num_out,), dtype=np.int64)
+                        for i in idxs:
+                            pred_idx = int(results[i][2])
+                            if 0 <= pred_idx < num_out:
+                                counts[pred_idx] += 1
+                        dist_csv = cls_dir / f"pred_distribution-{cls_name}.csv"
+                        with dist_csv.open("w", newline="", encoding="utf-8") as f:
+                            import csv as _csv
+                            w = _csv.writer(f)
+                            w.writerow(["predicted_index", "count"]) 
+                            for j in range(num_out):
+                                w.writerow([j, int(counts[j])])
+                        c.info(f"Saved prediction distribution for {cls_name}: {dist_csv}")
+                    except Exception as e:
+                        c.warn(f"Failed folder distribution for {cls_name}: {e}")
+        except Exception:
+            pass
+
+    # Optional per-class plots: files on X, %accuracy on Y for laminar/turbulent
+    try:
+        if mapping:
+            keys_lower = {k.lower(): k for k in mapping.keys()}
+            target = [k for x, k in keys_lower.items() if x in ("laminar", "turbulent")]
+            if target:
+                try:
+                    import matplotlib.pyplot as _plt  # type: ignore
+                    from matplotlib import ticker as _ticker  # type: ignore
+                    # plots dir under outputs_root/<subdir>/plots
+                    if base_outputs is not None:
+                        sub = out_subdir if isinstance(out_subdir, str) and out_subdir.strip() else "image"
+                        plots_dir = (base_outputs / sub / "plots").resolve()
+                    else:
+                        sub = out_subdir if isinstance(out_subdir, str) and out_subdir.strip() else "image"
+                        plots_dir = (Path(".") / "data" / "outputs" / sub / "plots").resolve()
+                    plots_dir.mkdir(parents=True, exist_ok=True)
+
+                    def _nearest_cls(p: Path) -> str | None:
+                        try:
+                            for anc in [p.parent] + list(p.parents):
+                                if anc.resolve() == root.resolve():
+                                    break
+                                nm = anc.name
+                                if nm in mapping:
+                                    return nm
+                        except Exception:
+                            return None
+                        return None
+
+                    for cls in target:
+                        xs: list[str] = []
+                        ys: list[float] = []
+                        for i, p in enumerate(processed_files):
+                            nm = _nearest_cls(p)
+                            if nm == cls:
+                                xs.append(p.name)
+                                if i < len(results):
+                                    ys.append(float(results[i][3]) * 100.0)
+                                else:
+                                    ys.append(0.0)
+                        if not xs:
+                            continue
+                        _plt.figure(figsize=(max(6, min(20, len(xs) * 0.2)), 4))
+                        _plt.bar(range(len(xs)), ys, color="#4C72B0")
+                        _plt.title(f"Accuracy by file ({cls})")
+                        _plt.ylabel("% accuracy (confidence)")
+                        _plt.gca().yaxis.set_major_formatter(_ticker.FormatStrFormatter('%.0f%%'))
+                        _plt.xticks(range(len(xs)), xs, rotation=90, fontsize=8)
+                        _plt.tight_layout()
+                        out_png = plots_dir / f"accuracy_by_file-{cls}.png"
+                        _plt.savefig(out_png, dpi=150)
+                        _plt.close()
+                        c.info(f"Saved plot: {out_png}")
+                except Exception as e:
+                    c.warn(f"Could not generate per-class plots (matplotlib missing?): {e}")
+    except Exception:
+        pass
 
 
 class InferenceRunner:
@@ -428,6 +1119,50 @@ class InferenceRunner:
         self.console = console_from_config(self.config)
         self.console.info(f"Loaded config from: {self.cfg_path}")
         self.console.info(f"Using device: {self.device}")
+
+    def _is_image_mode(self) -> bool:
+        try:
+            from common import PathResolver as _PR
+            return _PR.resolve_split_kind(self.config, "test").startswith("image")
+        except Exception:
+            return str(self.config.get("data_kind", "vector")).lower().startswith("image")
+
+    def _resolve_weights_path(self, weights: "str | None", cfg: Dict[str, Any]) -> Path:
+        candidates: list[str] = []
+        if isinstance(weights, str) and weights.strip():
+            candidates.append(weights)
+        for k in ("weights", "weights_path", "save_weights"):
+            v = cfg.get(k, None)
+            if isinstance(v, str) and v.strip():
+                candidates.append(v)
+        for w in candidates:
+            p = Path(w)
+            if not p.is_absolute():
+                p = (self.cfg_path.parent / p).resolve()
+            if p.exists():
+                return p
+        search_dirs: list[Path] = []
+        cfg_dir = self.cfg_path.parent
+        search_dirs.append((cfg_dir / "runs").resolve())
+        out_root = cfg.get("outputs_root", None)
+        if isinstance(out_root, str) and out_root.strip():
+            p2 = Path(out_root)
+            search_dirs.append(p2 if p2.is_absolute() else (cfg_dir / p2).resolve())
+        latest: Path | None = None
+        for d in search_dirs:
+            if not d.exists() or not d.is_dir():
+                continue
+            for pat in ("model-*.pth", "*.pth", "*.pt"):
+                for f in d.rglob(pat):
+                    if latest is None or f.stat().st_mtime > latest.stat().st_mtime:
+                        latest = f
+        if latest is not None:
+            self.console.warn(f"[weights] None specified; using latest found: {latest}")
+            return latest
+        tried = ", ".join(candidates) or "<none>"
+        raise FileNotFoundError(
+            f"Weights not found. Pass --weights, set weights/weights_path/save_weights in config, or place a .pth/.pt in runs/. Tried: {tried}"
+        )
 
     def run(
         self,
@@ -452,47 +1187,209 @@ class InferenceRunner:
         recurse: bool,
     ) -> None:
         cfg = self.config
+        # Branch: image-mode inference uses directory of images instead of vector fields
+        is_image = self._is_image_mode()
+
+        if is_image:
+            # Resolve test_image_dir (or fallback to train_image_dir)
+            img_dir = cfg.get("test_image_dir", None) or cfg.get("train_image_dir", None)
+            if not isinstance(img_dir, str) or not img_dir.strip():
+                raise RuntimeError("For image inference set test_image_dir or train_image_dir in config or pass --field-path to point at the directory.")
+            # Anchor and auto-descend into 'image' subfolder when a container path is provided
+            resolver = PathResolver(
+                self.cfg_path,
+                outputs_root=str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None,
+            )
+            p_img = resolver.anchor(img_dir)
+            # If the anchored path does not exist, try parent/image/<basename> as a smart fallback
+            if p_img is not None and not p_img.exists():
+                try:
+                    parent = p_img.parent
+                    alt = (parent / "image" / p_img.name).resolve()
+                    if alt.exists() and alt.is_dir():
+                        self.console.info(f"Resolved missing path via image subfolder: {alt}")
+                        p_img = alt
+                except Exception:
+                    pass
+            if p_img is not None and p_img.exists() and p_img.is_dir():
+                candidate = p_img / "image"
+                try:
+                    if candidate.exists() and candidate.is_dir():
+                        img_dir = str(candidate.resolve())
+                        self.console.info(f"Auto-descended into image subfolder: {img_dir}")
+                    else:
+                        img_dir = str(p_img)
+                except Exception:
+                    img_dir = str(p_img)
+            # Final sanity print of resolved image root
+            try:
+                # Inputs section header for image mode
+                self.console.header("Inference Inputs")
+                self.console.info("Mode: image")
+                self.console.info(f"Root: {img_dir}")
+            except Exception:
+                pass
+            # Build model
+            inferred_in_ch = int(cfg.get("image_channels", 3))
+            model = build_model(cfg, inferred_in_ch)
+            # Resolve weights via shared helper and load
+            resolved = self._resolve_weights_path(weights, cfg)
+            load_weights(model, resolved, self.device)
+            # Optional compile and channels-last for speed
+            def _opt(key: str, default=None):
+                inf = self.config.get("inference", {}) if isinstance(self.config.get("inference"), dict) else {}
+                return self.config.get(key, inf.get(key, default))
+            want_compile = bool(_opt("torch_compile", False))
+            use_channels_last = bool(_opt("channels_last", False))
+            if want_compile:
+                try:
+                    model = torch.compile(model)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            if use_channels_last:
+                try:
+                    model = model.to(memory_format=torch.channels_last)
+                except Exception:
+                    pass
+            model.to(self.device)
+
+            # Model/Weights summary (image mode)
+            try:
+                self.console.header("Model / Weights")
+                rows = [
+                    ["device", str(self.device)],
+                    ["weights", str(resolved)],
+                    ["input_channels", str(inferred_in_ch)],
+                    ["num_classes", str(getattr(model, "num_classes", "?"))],
+                ]
+                self.console.table(["key", "value"], rows, align=["l", "l"], title="Model Info")
+            except Exception:
+                pass
+            # Resolve outputs from CLI or fallback to config, and anchor
+            if not (isinstance(file_summary, str) and file_summary.strip()):
+                file_summary = cfg.get("file_summary", None)
+            if not (isinstance(cm_csv, str) and cm_csv.strip()):
+                cm_csv = cfg.get("cm_csv", None)
+            if not (isinstance(cm_png, str) and cm_png.strip()):
+                cm_png = cfg.get("cm_png", None)
+            sum_path = resolver.anchor(file_summary) if isinstance(file_summary, str) and file_summary.strip() else None
+            cmc_path = resolver.anchor(cm_csv) if isinstance(cm_csv, str) and cm_csv.strip() else None
+            cmp_path = resolver.anchor(cm_png) if isinstance(cm_png, str) and cm_png.strip() else None
+
+            # Outputs summary (image mode)
+            try:
+                self.console.header("Outputs")
+                rows: list[list[str]] = [["outputs_root", str(resolver.outputs_root)]]
+                if sum_path is not None:
+                    rows.append(["file_summary", str(sum_path)])
+                if cmc_path is not None:
+                    rows.append(["cm_csv", str(cmc_path)])
+                if cmp_path is not None:
+                    rows.append(["cm_png", str(cmp_path)])
+                self.console.table(["key", "path"], rows, align=["l", "l"], title="Requested Outputs")
+            except Exception:
+                pass
+            # Optional filter: include only specific class folders (e.g., ["laminar","turbulent"]) from config
+            try:
+                inf_sc = cfg.get("inference", {}) if isinstance(cfg.get("inference"), dict) else {}
+                include_classes_cfg = cfg.get("image_include_classes", None)
+                if not isinstance(include_classes_cfg, list) or not include_classes_cfg:
+                    include_classes_cfg = inf_sc.get("image_include_classes", None)
+                if not isinstance(include_classes_cfg, list) or not include_classes_cfg:
+                    include_classes_cfg = None
+            except Exception:
+                include_classes_cfg = None
+
+            run_image_inference(
+                config=cfg,
+                device=self.device,
+                model=model,
+                image_root=str(img_dir),
+                base_outputs=resolver.outputs_root,
+                file_summary_out=sum_path,
+                cm_csv_out=cmc_path,
+                cm_png_out=cmp_path,
+                include_classes=include_classes_cfg,
+            )
+            # Final summary (image mode)
+            try:
+                self.console.header("Done")
+                rows: list[list[str]] = [["outputs_root", str(resolver.outputs_root)]]
+                if sum_path is not None:
+                    rows.append(["file_summary", str(sum_path)])
+                if cmc_path is not None:
+                    rows.append(["cm_csv", str(cmc_path)])
+                if cmp_path is not None:
+                    rows.append(["cm_png", str(cmp_path)])
+                self.console.table(["key", "path"], rows, align=["l", "l"], title="Artifacts")
+            except Exception:
+                pass
+            return
+
         fields = choose_fields(cfg, field_path)
         if not fields:
             raise RuntimeError("field_path or test/train_field_path must be provided via CLI or config")
 
         resolver = PathResolver(self.cfg_path, outputs_root=str(cfg.get("outputs_root")) if isinstance(cfg.get("outputs_root"), str) else None)
-        anchored_fields = resolver.expand_fields(fields, recurse=recurse)
-        use_field = anchored_fields[0]
+        # Auto-enable recursion if config requests it or any input is a directory-like path
+        cfg_recurse = bool(cfg.get("recurse", False))
+        looks_like_dir = False
+        try:
+            for raw in fields:
+                p = Path(raw)
+                if (not p.suffix) or any(ch in str(p) for ch in ["*", "?", "["]):
+                    looks_like_dir = True
+                    break
+        except Exception:
+            looks_like_dir = False
+        effective_recurse = bool(recurse or cfg_recurse or looks_like_dir)
+        anchored_fields = resolver.expand_fields(fields, recurse=effective_recurse)
 
-        # Resolve weights
-        weights_path: str | None = None
-        candidates: list[str] = []
-        if isinstance(weights, str) and weights.strip():
-            candidates.append(weights)
-        for k in ("weights", "weights_path", "save_weights"):
-            v = cfg.get(k, None)
-            if isinstance(v, str) and v.strip():
-                candidates.append(v)
-        resolved_candidates: list[str] = []
-        for w in candidates:
-            p = Path(w)
-            if not p.is_absolute():
-                p = (self.cfg_path.parent / p).resolve()
-            resolved_candidates.append(str(p))
-            if p.exists():
-                weights_path = str(p)
-                break
-        if weights_path is None:
-            runs_dir = (self.cfg_path.parent / "runs").resolve()
-            latest = None
-            if runs_dir.exists() and runs_dir.is_dir():
-                files = list(runs_dir.glob("*.pth")) + list(runs_dir.glob("*.pt"))
-                if files:
-                    latest = max(files, key=lambda f: f.stat().st_mtime)
-            if latest is not None:
-                weights_path = str(latest)
-                self.console.info(f"Auto-selected latest weights from runs/: {weights_path}")
-        if weights_path is None:
-            tried = ", ".join(resolved_candidates) or "<none>"
-            raise RuntimeError(
-                f"Weights file not provided or not found. Pass --weights, set weights/weights_path/save_weights in config, or place a .pth/.pt in runs/. Tried: {tried}"
-            )
+        # Prefer actual vector field inputs for inference; skip mapping CSVs like file_name,label
+        def _is_vector_candidate(path_str: str) -> bool:
+            try:
+                q = Path(path_str)
+                if not q.is_file():
+                    return False
+                ext = q.suffix.lower()
+                if ext in (".npy", ".npz"):
+                    return True
+                if ext == ".csv":
+                    with q.open("r", encoding="utf-8", errors="ignore") as f:
+                        first = f.readline().lower()
+                    if ("file_name" in first and "label" in first):
+                        return False
+                    return any(k in first for k in ("x", "y", "delta", "dx", "dy"))
+                return False
+            except Exception:
+                return False
+
+        vector_fields = [s for s in anchored_fields if _is_vector_candidate(s)]
+        if vector_fields:
+            use_field = vector_fields[0]
+        else:
+            use_field = anchored_fields[0]
+            self.console.warn(f"No obvious vector-field files found under inputs; using first match: {use_field}")
+
+        # Inputs section header for vector mode
+        try:
+            self.console.header("Inference Inputs")
+            self.console.info("Mode: vector")
+            self.console.info(f"Requested inputs: {len(fields)}")
+            self.console.info(f"Resolved files: {len(anchored_fields)}")
+            max_show = 12
+            show = anchored_fields[:max_show]
+            rows = [[f"{i}", s] for i, s in enumerate(show)]
+            if rows:
+                self.console.table(["idx", "path"], rows, align=["r", "l"], title="Files To Process")
+            if len(anchored_fields) > max_show:
+                self.console.info(f"... and {len(anchored_fields)-max_show} more")
+        except Exception:
+            pass
+
+        # Resolve weights (vector path)
+        resolved_w = self._resolve_weights_path(weights, cfg)
+        weights_path: str = str(resolved_w)
         self.console.info(f"Using weights: {weights_path}")
 
         # Build model
@@ -528,6 +1425,25 @@ class InferenceRunner:
         logits_path = resolver.anchor(logits_out) if logits_out else None
         heat_dir, stitch_path = resolver.decide_heatmap_paths(generate=gen_hm, heatmaps_dir=heatmaps_dir, stitched=stitch_heatmap)
         cm_csv_path, cm_png_path = resolver.decide_cm_paths(generate=gen_cm, cm_csv=cm_csv, cm_png=cm_png)
+        # Rebase defaults under outputs_root/vector when user didn't specify custom paths
+        try:
+            default_hd = resolver.default_heatmaps_dir() if gen_hm else None
+            default_sp = resolver.default_stitched_heatmap() if gen_hm else None
+            default_cc = resolver.default_cm_csv() if gen_cm else None
+            default_cp = resolver.default_cm_png() if gen_cm else None
+            base_vec = resolver.outputs_root / "vector"
+            if gen_hm:
+                if heatmaps_dir is None and heat_dir is not None and default_hd is not None and heat_dir == default_hd:
+                    heat_dir = (base_vec / "heatmaps").resolve()
+                if stitch_heatmap is None and stitch_path is not None and default_sp is not None and stitch_path == default_sp:
+                    stitch_path = (base_vec / default_sp.name).resolve()
+            if gen_cm:
+                if cm_csv is None and cm_csv_path is not None and default_cc is not None and cm_csv_path == default_cc:
+                    cm_csv_path = (base_vec / default_cc.name).resolve()
+                if cm_png is None and cm_png_path is not None and default_cp is not None and cm_png_path == default_cp:
+                    cm_png_path = (base_vec / default_cp.name).resolve()
+        except Exception:
+            pass
 
         # File labels manifest
         labels_map: dict[str, int] | None = None
@@ -586,7 +1502,18 @@ class InferenceRunner:
                 self.console.warn(f"Failed to establish file summary path: {e}")
 
         cm_accum: "np.ndarray | None" = None
-        for fp in anchored_fields:
+        report_rows: list[tuple[str, str, int, float]] = []
+        report_probs: list[tuple[str, list[float]]] = []
+        # Iterate only over vector-field inputs when possible
+        iter_fields = [s for s in anchored_fields if 'vector_fields' in locals() and s in vector_fields] if 'vector_fields' in locals() and vector_fields else anchored_fields
+        # Vector per-file progress bar
+        _iter = None
+        try:
+            from tqdm import tqdm as _tqdm  # type: ignore
+            _iter = _tqdm(iter_fields, desc="vector", unit="file")
+        except Exception:
+            _iter = iter_fields
+        for fp in _iter:
             stem = Path(fp).stem
             per_out = out_path.with_name(f"{out_path.stem}-{stem}{out_path.suffix}") if out_path is not None else None
             per_probs = probs_path.with_name(f"{probs_path.stem}-{stem}{probs_path.suffix}") if probs_path is not None else None
@@ -623,10 +1550,36 @@ class InferenceRunner:
                 cm_png_out=per_cm_png,
                 show_heatmap=show_heatmap,
                 file_summary_out=effective_summary_path,
+                report_list=report_rows,
+                report_probs_list=report_probs,
             )
             if ret_cm is not None:
                 import numpy as _np
                 cm_accum = ret_cm.copy() if cm_accum is None else (cm_accum + ret_cm)
+
+        # Pretty-print a table of per-file predictions to terminal
+        try:
+            if report_rows:
+                headers = ["file_name", "predicted_class", "index", "confidence%"]
+                rows = [[a, b, str(c), f"{d:.2f}"] for (a, b, c, d) in report_rows]
+                self.console.table(headers, rows, align=["l", "l", "r", "r"], title="Per-file Predictions")
+        except Exception:
+            pass
+
+        # Also print a table of mean probabilities per file (per class)
+        try:
+            if report_probs:
+                # Determine class headers
+                cls = class_names if (class_names and len(class_names) == int(model.classifier[-1].out_features)) else [f"p{i}" for i in range(int(model.classifier[-1].out_features))]
+                headers = ["file_name"] + [f"{name}%" for name in cls]
+                rows: list[list[str]] = []
+                for (fname, probs_list) in report_probs:
+                    perc = [f"{float(p)*100.0:.2f}" for p in probs_list]
+                    rows.append([fname] + perc)
+                aligns = ["l"] + ["r"] * (len(headers) - 1)
+                self.console.table(headers, rows, align=aligns, title="Per-file Mean Probabilities")
+        except Exception:
+            pass
 
         if cm_accum is not None:
             try:
@@ -635,13 +1588,13 @@ class InferenceRunner:
                 save_confusion_outputs(cm_accum, class_names, overall_csv, overall_png, console=self.console)
             except Exception as e:
                 self.console.warn(f"Failed to save overall confusion matrix: {e}")
-    class InferenceRunner:
-        """
+    """
+        [duplicate runner removed]
         High-level, class-based inference runner for prototype two.
         Keeps CLI thin and supports the same config keys as prototype one.
-        """
+        [duplicate runner removed]
 
-    def __init__(self, cfg_path: Path, device_pref: str = "auto") -> None:
+    def __init__dupe(self, cfg_path: Path, device_pref: str = "auto") -> None:
         # Use centralized ConfigManager to load/normalize config
         cfg_mgr = ConfigManager(cfg_path)
         self.cfg_path = cfg_mgr.path
@@ -653,7 +1606,7 @@ class InferenceRunner:
         self.console.info(f"Loaded config from: {self.cfg_path}")
         self.console.info(f"Using device: {self.device}")
 
-    def run(
+    def run_dupe(
         self,
         *,
         weights: str | None,
@@ -675,6 +1628,140 @@ class InferenceRunner:
         file_labels: str | None,
         recurse: bool,
     ) -> None:
+        # Image-mode short-circuit: run folder-based inference and return
+        try:
+            from common import PathResolver as _PR
+            is_image = _PR.resolve_split_kind(self.config, "test").startswith("image")
+        except Exception:
+            is_image = str(self.config.get("data_kind", "vector")).lower().startswith("image")
+
+        if is_image:
+            # Choose image root from CLI field_path (if directory) or config test/train_image_dir
+            img_dir: str | None = None
+            if isinstance(field_path, str) and field_path.strip():
+                p = Path(field_path)
+                if p.exists() and p.is_dir():
+                    img_dir = str(p)
+            if img_dir is None:
+                img_dir = self.config.get("test_image_dir", None) or self.config.get("train_image_dir", None)
+            if not isinstance(img_dir, str) or not img_dir.strip():
+                raise RuntimeError("For image inference set test_image_dir or train_image_dir in config or pass --field-path pointing at the image directory")
+
+            # Print a brief image-mode summary
+            try:
+                size = self.config.get("image_size", [256, 256])
+                channels = int(self.config.get("image_channels", 3))
+                # Discover classes and count images
+                classes: list[str] | None = None
+                total_imgs = None
+                per_class: list[tuple[str, int]] = []
+                cfg_cls = self.config.get("class_names", None)
+                root = Path(img_dir)
+                exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+                items = [q for q in root.rglob("*") if q.is_file() and q.suffix.lower() in exts]
+                total_imgs = len(items)
+                if isinstance(cfg_cls, list) and cfg_cls:
+                    classes = [str(x) for x in cfg_cls]
+                else:
+                    clset = sorted({q.parent.name for q in items}) if items else []
+                    classes = clset
+                if classes:
+                    counts = {name: 0 for name in classes}
+                    for q in items:
+                        nm = q.parent.name
+                        if nm in counts:
+                            counts[nm] += 1
+                    per_class = [(k, counts.get(k, 0)) for k in classes]
+                rows = [
+                    ["root", str(img_dir)],
+                    ["image_size", str(size)],
+                    ["image_channels", str(channels)],
+                    ["classes", ", ".join(classes) if classes else "<none>"],
+                    ["images_total", str(total_imgs) if total_imgs is not None else "?"]
+                ]
+                self.console.table(["Image Setting", "Value"], rows, align=["l", "l"], title="Image Inference")
+                if per_class:
+                    self.console.table(["Class", "Count"], [[k, str(v)] for (k, v) in per_class], align=["l", "r"], title="Image Files")
+            except Exception:
+                pass
+
+            # Build model using image config and load weights
+            inferred_in_ch = int(self.config.get("image_channels", 3))
+            model = build_model(self.config, inferred_in_ch)
+            # Resolve weights using shared helper and load
+            resolved = self._resolve_weights_path(weights, self.config)
+            load_weights(model, resolved, self.device)
+            model.to(self.device)
+            try:
+                # Echo chosen weights path in summary table
+                self.console.table(["Image Setting", "Value"], [["weights", str(resolved)]], align=["l", "l"])
+            except Exception:
+                pass
+            # If a 'mixed' subfolder exists, run two passes: {non-mixed classes} and {mixed}
+            # Resolve outputs_root independently here to avoid unbound local issues
+            base_outputs = PathResolver(
+                self.cfg_path,
+                outputs_root=str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None,
+            ).outputs_root
+            try:
+                root = Path(img_dir)
+                mixed_name = str(self.config.get("mixed_folder_name", "mixed"))
+                classes = sorted([d.name for d in root.iterdir() if d.is_dir()])
+            except Exception:
+                mixed_name = "mixed"
+                classes = []
+            if mixed_name in classes and len(classes) >= 2:
+                main_classes = [c for c in classes if c != mixed_name]
+                try:
+                    self.console.info(f"Running image inference (non-mixed classes): {', '.join(main_classes)}")
+                except Exception:
+                    pass
+                # Pass 1: non-mixed classes with CM
+                run_image_inference(
+                    config=self.config,
+                    device=self.device,
+                    model=model,
+                    image_root=str(img_dir),
+                    base_outputs=base_outputs,
+                    file_summary_out=Path(file_summary) if isinstance(file_summary, str) and file_summary.strip() else None,
+                    cm_csv_out=None,
+                    cm_png_out=None,
+                    include_classes=main_classes,
+                    out_subdir="image",
+                )
+                # Pass 2: mixed-only without CM
+                try:
+                    self.console.info(f"Running image inference (mixed only): {mixed_name}")
+                except Exception:
+                    pass
+                run_image_inference(
+                    config=self.config,
+                    device=self.device,
+                    model=model,
+                    image_root=str(img_dir),
+                    base_outputs=base_outputs,
+                    file_summary_out=None,
+                    cm_csv_out=None,
+                    cm_png_out=None,
+                    include_classes=[mixed_name],
+                    out_subdir="image-mixed",
+                )
+            else:
+                # Single pass when no 'mixed' class present
+                run_image_inference(
+                    config=self.config,
+                    device=self.device,
+                    model=model,
+                    image_root=str(img_dir),
+                    base_outputs=base_outputs,
+                    file_summary_out=Path(file_summary) if isinstance(file_summary, str) and file_summary.strip() else None,
+                    cm_csv_out=None,
+                    cm_png_out=None,
+                    include_classes=None,
+                    out_subdir="image",
+                )
+            return
+
         # Resolve field paths (arg overrides config). Support list or delimited string.
         fields: list[str] = []
         # CLI overrides config
@@ -696,9 +1783,43 @@ class InferenceRunner:
             self.cfg_path,
             outputs_root=str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None,
         )
-        anchored_fields: list[str] = resolver.expand_fields(fields, recurse=recurse)
-        # Primary field for building model / inferring channels
-        use_field = anchored_fields[0]
+        # Auto-enable recursion if config requests it or any input is a directory-like path
+        cfg_recurse = bool(self.config.get("recurse", False))
+        looks_like_dir = False
+        try:
+            for raw in fields:
+                p = Path(raw)
+                if (not p.suffix) or any(ch in str(p) for ch in ["*", "?", "["]):
+                    looks_like_dir = True
+                    break
+        except Exception:
+            looks_like_dir = False
+        effective_recurse = bool(recurse or cfg_recurse or looks_like_dir)
+
+        anchored_fields: list[str] = resolver.expand_fields(fields, recurse=effective_recurse)
+        # Prefer actual vector field inputs; skip mapping CSVs like file_name,label
+        def _is_vector_candidate(path_str: str) -> bool:
+            try:
+                q = Path(path_str)
+                if not q.is_file():
+                    return False
+                ext = q.suffix.lower()
+                if ext in (".npy", ".npz"):
+                    return True
+                if ext == ".csv":
+                    with q.open("r", encoding="utf-8", errors="ignore") as f:
+                        first = f.readline().lower()
+                    if ("file_name" in first and "label" in first):
+                        return False
+                    return any(k in first for k in ("x", "y", "delta", "dx", "dy"))
+                return False
+            except Exception:
+                return False
+
+        vector_fields = [s for s in anchored_fields if _is_vector_candidate(s)]
+        use_field = vector_fields[0] if vector_fields else anchored_fields[0]
+        if not vector_fields:
+            self.console.warn(f"No obvious vector-field files found under inputs; using first match: {use_field}")
 
         # Resolve weights path
         weights_path: str | None = None
@@ -743,6 +1864,19 @@ class InferenceRunner:
         model = build_model(self.config, inferred_in_ch=in_ch).to(self.device)
         load_weights(model, Path(weights_path), self.device)
         self.console.info("Model and weights loaded.")
+
+        # Model/Weights summary (vector mode)
+        try:
+            self.console.header("Model / Weights")
+            rows = [
+                ["device", str(self.device)],
+                ["weights", str(weights_path)],
+                ["input_channels", str(in_ch)],
+                ["num_classes", str(getattr(model, "num_classes", "?"))],
+            ]
+            self.console.table(["key", "value"], rows, align=["l", "l"], title="Model Info")
+        except Exception:
+            pass
 
         # Resolve optional outputs from CLI or fallback to config
         cfg = self.config
@@ -791,6 +1925,28 @@ class InferenceRunner:
         out_path = resolver.anchor(output) if output else None
         probs_path = resolver.anchor(probs_out) if probs_out else None
         logits_path = resolver.anchor(logits_out) if logits_out else None
+
+        # Outputs summary (vector mode)
+        try:
+            self.console.header("Outputs")
+            rows: list[list[str]] = [["outputs_root", str(resolver.outputs_root)]]
+            if out_path is not None:
+                rows.append(["predictions_csv", str(out_path)])
+            if probs_path is not None:
+                rows.append(["probs_npy", str(probs_path)])
+            if logits_path is not None:
+                rows.append(["logits_npy", str(logits_path)])
+            if heatmaps_dir is not None:
+                rows.append(["heatmaps_dir", str(heatmaps_dir)])
+            if stitch_heatmap is not None:
+                rows.append(["stitched_heatmap", str(stitch_heatmap)])
+            if cm_csv is not None:
+                rows.append(["cm_csv", str(cm_csv)])
+            if cm_png is not None:
+                rows.append(["cm_png", str(cm_png)])
+            self.console.table(["key", "path"], rows, align=["l", "l"], title="Base Output Targets")
+        except Exception:
+            pass
 
         # File labels manifest (for test CSVs without label column)
         labels_manifest_path: Path | None = None
@@ -869,7 +2025,10 @@ class InferenceRunner:
 
         # Run inference for each field path; suffix outputs by input stem to avoid overwrites
         cm_accum: "np.ndarray | None" = None
-        for fp in anchored_fields:
+        report_rows: list[tuple[str, str, int, float]] = []
+        report_probs: list[tuple[str, list[float]]] = []
+        iter_fields = [s for s in anchored_fields if 'vector_fields' in locals() and s in vector_fields] if 'vector_fields' in locals() and vector_fields else anchored_fields
+        for fp in iter_fields:
             stem = Path(fp).stem
             per_out = out_path.with_name(f"{out_path.stem}-{stem}{out_path.suffix}") if out_path is not None else None
             per_probs = (
@@ -916,10 +2075,78 @@ class InferenceRunner:
                 cm_png_out=per_cm_png,
                 show_heatmap=show_heatmap,
                 file_summary_out=effective_summary_path,
+                report_list=report_rows,
+                report_probs_list=report_probs,
             )
             if ret_cm is not None:
                 import numpy as _np
                 cm_accum = ret_cm.copy() if cm_accum is None else (cm_accum + ret_cm)
+
+        # Pretty-print a table of per-file predictions to terminal
+        try:
+            if report_rows:
+                headers = ["file_name", "predicted_class", "index", "confidence%"]
+                rows = [[a, b, str(c), f"{d:.2f}"] for (a, b, c, d) in report_rows]
+                self.console.table(headers, rows, align=["l", "l", "r", "r"], title="Per-file Predictions")
+        except Exception:
+            pass
+
+        # Also print a table of mean probabilities per file (per class)
+        try:
+            if report_probs:
+                # Determine class headers
+                try:
+                    num_out = int(getattr(model.classifier[-1], 'out_features', len(report_probs[0][1])))
+                except Exception:
+                    num_out = len(report_probs[0][1])
+                # Build display labels as "class i (name)" when class_names are available
+                names_src = None
+                try:
+                    if class_names and len(class_names) == num_out:
+                        names_src = class_names
+                    else:
+                        cfg_names = cfg.get("class_names", None)
+                        if isinstance(cfg_names, list) and len(cfg_names) == num_out:
+                            names_src = [str(s) for s in cfg_names]
+                except Exception:
+                    names_src = None
+                if names_src is not None:
+                    _names = [str(n) for n in names_src]
+                    _labels = [f"class {i} ({_names[i]})" for i in range(num_out)]
+                else:
+                    _names = [f"p{i}" for i in range(num_out)]
+                    _labels = [f"class {i}" for i in range(num_out)]
+                headers = ["file_name"] + [f"{lab}%" for lab in _labels]
+                rows: list[list[str]] = []
+                for (fname, probs_list) in report_probs:
+                    perc = [f"{float(p)*100.0:.2f}" for p in probs_list]
+                    rows.append([fname] + perc)
+                aligns = ["l"] + ["r"] * (len(headers) - 1)
+                self.console.table(headers, rows, align=aligns, title="Per-file Mean Probabilities")
+                # Bias indicator: average probabilities across files and report dominant class
+                try:
+                    avg = [0.0] * num_out
+                    count = max(len(report_probs), 1)
+                    for (_fn, pl) in report_probs:
+                        for i in range(min(num_out, len(pl))):
+                            avg[i] += float(pl[i])
+                    avg = [a / count for a in avg]
+                    best_idx = max(range(num_out), key=lambda i: avg[i])
+                    if num_out >= 2:
+                        srt = sorted(avg, reverse=True)
+                        delta = (srt[0] - srt[1]) * 100.0
+                    else:
+                        delta = 0.0
+                    # Build readable names for bias line
+                    disp_best = _labels[best_idx]
+                    avg_str = ", ".join([f"{_labels[i]}={avg[i]*100.0:.2f}%" for i in range(num_out)])
+                    self.console.info(
+                        f"Bias indicator: leaning toward {disp_best} (avg: {avg_str}; Δ={delta:.2f}pp)"
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # After processing all files, save an overall confusion matrix if any
         if cm_accum is not None:
@@ -934,6 +2161,24 @@ class InferenceRunner:
             except Exception as e:
                 self.console.warn(f"Failed to save overall confusion matrix: {e}")
 
+        # Final summary (vector mode)
+        try:
+            self.console.header("Done")
+            rows: list[list[str]] = [["outputs_root", str(resolver.outputs_root)]]
+            if out_path is not None:
+                rows.append(["predictions_csv", str(out_path)])
+            if probs_path is not None:
+                rows.append(["probs_npy", str(probs_path)])
+            if logits_path is not None:
+                rows.append(["logits_npy", str(logits_path)])
+            if cm_csv is not None:
+                rows.append(["cm_csv", str(cm_csv_path if cm_csv_path is not None else cm_csv)])
+            if cm_png is not None:
+                rows.append(["cm_png", str(cm_png_path if cm_png_path is not None else cm_png)])
+            self.console.table(["key", "path"], rows, align=["l", "l"], title="Artifacts")
+        except Exception:
+            pass
+    """
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inference runner for SimpleCNN on vector fields (prototype two)")
