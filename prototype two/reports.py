@@ -11,9 +11,10 @@ import numpy as np
 from common import ConfigManager, PathResolver, save_confusion_outputs, ensure_outputs_ready, plot_training_progress
 from console import console_from_config
 try:
-    from data_loader import build_class_index
+    from data_loader import build_class_index, _resolve_root_path as _resolve_root_path_img
 except Exception:
     build_class_index = None  # type: ignore
+    _resolve_root_path_img = None  # type: ignore
 
 
 @dataclass
@@ -23,6 +24,8 @@ class _Record:
     predicted_id: int
     confidence_pct: float
     true_class: str | None
+    velocity_pred: float | None
+    reynolds_pred: float | None
 
 
 def _true_class_name(rel_path: Path) -> str | None:
@@ -103,6 +106,8 @@ def _load_records(csv_path: Path, root: Path, mapping: Dict[str, int] | None, co
                     or row.get("%accuracy")
                     or row.get("confidence")
                 )
+                vel_pred = _parse_float(row.get("velocity_pred"))
+                re_pred = _parse_float(row.get("reynolds_pred"))
                 true_cls = None
                 if labels_map:
                     candidates = [rel_path.name, rel_path.as_posix(), str(rel_path), rel_path.stem]
@@ -119,6 +124,8 @@ def _load_records(csv_path: Path, root: Path, mapping: Dict[str, int] | None, co
                         predicted_id=pred_idx,
                         confidence_pct=conf,
                         true_class=true_cls,
+                        velocity_pred=vel_pred,
+                        reynolds_pred=re_pred,
                     )
                 )
     except Exception as e:
@@ -144,8 +151,30 @@ def _compute_confusion_matrix(
             continue
         y_true.append(int(mapping[rec.true_class]))
         y_pred.append(int(rec.predicted_id))
+
+    # Fallback: if no ground-truth labels, produce a diagonal matrix of prediction counts
     if not y_true:
-        console.warn("[reports] No ground-truth labels found for confusion matrix")
+        try:
+            console.warn("[reports] No ground-truth labels found; falling back to prediction-count matrix (diagonal only).")
+        except Exception:
+            pass
+        counts = np.zeros((num_out,), dtype=np.int64)
+        for rec in records:
+            if 0 <= rec.predicted_id < num_out:
+                counts[int(rec.predicted_id)] += 1
+        cm = np.zeros((num_out, num_out), dtype=np.int64)
+        for i in range(num_out):
+            cm[i, i] = counts[i]
+        class_names = list(mapping.keys())
+        save_confusion_outputs(cm, class_names, cm_csv, cm_png, console=console)
+        try:
+            headers = ["true\\pred"] + class_names
+            rows: List[List[str]] = []
+            for i, tn in enumerate(class_names):
+                rows.append([tn] + [str(int(cm[i, j])) for j in range(num_out)])
+            console.table(headers, rows, align=["l"] + ["r"] * len(class_names), title="Prediction count matrix (no labels)")
+        except Exception:
+            pass
         return
     y_true_arr = np.asarray(y_true, dtype=np.int64)
     y_pred_arr = np.asarray(y_pred, dtype=np.int64)[: y_true_arr.shape[0]]
@@ -251,35 +280,64 @@ def _generate_plots(
     plots_dir = (base_dir / "plots").resolve()
     plots_dir.mkdir(parents=True, exist_ok=True)
 
+    # Regression plots (velocity, Reynolds) if predictions are present
+    vel_vals = [r.velocity_pred for r in records if r.velocity_pred is not None]
+    re_vals = [r.reynolds_pred for r in records if r.reynolds_pred is not None]
+    if vel_vals:
+        try:
+            _plt.figure(figsize=(6, 4))
+            _plt.plot(range(1, len(vel_vals) + 1), vel_vals, color="#2C7BB6", linewidth=1.2)
+            _plt.xlabel("image index")
+            _plt.ylabel("velocity (predicted)")
+            _plt.title("Predicted velocity")
+            _plt.grid(alpha=0.3, linestyle="--", linewidth=0.5)
+            out_vel = plots_dir / "velocity_predictions.png"
+            console.info(f"[reports] plotting velocity predictions -> {out_vel}")
+            _plt.tight_layout()
+            _plt.savefig(out_vel, dpi=150)
+            _plt.close()
+        except Exception as e:
+            console.warn(f"[reports] failed to plot velocity predictions: {e}")
+    if re_vals:
+        try:
+            _plt.figure(figsize=(6, 4))
+            _plt.plot(range(1, len(re_vals) + 1), re_vals, color="#D9534F", linewidth=1.2)
+            _plt.xlabel("image index")
+            _plt.ylabel("Reynolds number (predicted)")
+            _plt.title("Predicted Reynolds number")
+            _plt.grid(alpha=0.3, linestyle="--", linewidth=0.5)
+            out_re = plots_dir / "reynolds_predictions.png"
+            console.info(f"[reports] plotting Reynolds predictions -> {out_re}")
+            _plt.tight_layout()
+            _plt.savefig(out_re, dpi=150)
+            _plt.close()
+        except Exception as e:
+            console.warn(f"[reports] failed to plot Reynolds predictions: {e}")
+
     if mapping:
         lower_name_map = {name.lower(): name for name in mapping.keys()}
         if "laminar" in lower_name_map and "turbulent" in lower_name_map:
             lam_idx = mapping.get(lower_name_map["laminar"])
             tur_idx = mapping.get(lower_name_map["turbulent"])
             if lam_idx is not None and tur_idx is not None:
-                x_vals: List[int] = []
                 y_vals: List[int] = []
-                for idx, rec in enumerate(records):
+                for rec in records:
                     if rec.predicted_id == lam_idx:
-                        x_vals.append(idx + 1)  # shift to 1-based so log scale is valid
                         y_vals.append(1)
                     elif rec.predicted_id == tur_idx:
-                        x_vals.append(idx + 1)
-                        y_vals.append(-1)
+                        y_vals.append(0)
                 if y_vals:
-                    # Keep figure compact: 5\" wide x 4\" tall for consistent output
-                    _plt.figure(figsize=(5, 4))
-                    # Scatter plot to highlight individual classification events
-                    _plt.scatter(x_vals, y_vals, s=10, color="#D9534F")
-                    _plt.xscale("log")
-                    _plt.yticks([-1, 1], ["turbulent (-1)", "laminar (+1)"])
-                    _plt.xlabel("image index (log scale)")
-                    _plt.ylabel("classification")
-                    _plt.title("Laminar/Turbulent step classification")
+                    _plt.figure(figsize=(6, 4))
+                    x_vals = list(range(1, len(y_vals) + 1))
+                    _plt.scatter(x_vals, y_vals, s=10, color="#5B8FF9")
+                    _plt.yticks([0, 1], ["turbulent (0)", "laminar (1)"])
+                    _plt.xlabel("image index")
+                    _plt.ylabel("predicted class")
+                    _plt.title("Predicted laminar/turbulent")
                     _plt.grid(alpha=0.3, linestyle="--", linewidth=0.5)
                     out_step = plots_dir / "classification_step.png"
+                    console.info(f"[reports] plotting laminar/turbulent -> {out_step}")
                     _plt.tight_layout()
-                    console.info(f"[reports] plotting laminar/turbulent step -> {out_step}")
                     _plt.savefig(out_step, dpi=150)
                     _plt.close()
 
@@ -327,8 +385,10 @@ def _maybe_plot_training_progress(*, base_dir: Path, config: Dict[str, Any], con
         return
 
     out_png = (base_dir / "training" / "training_progress.png").resolve()
+    model_name = str(config.get("model_name", config.get("model_type", ""))).strip()
+    custom_title = f"Training Progress - {model_name}" if model_name else "Training Progress"
     console.info(f"[reports] plotting training progress -> {out_png}")
-    plot_training_progress(history_rows, out_png, console=console)
+    plot_training_progress(history_rows, out_png, console=console, title=custom_title)
 
 
 def generate_image_reports(
@@ -355,6 +415,30 @@ def generate_image_reports(
     if not records:
         console.warn("[reports] No prediction rows found; skipping reports generation")
         return
+    # If the folder-based mapping is missing/misleading (e.g., single folder like 'set one'),
+    # rebuild it from labels or predicted classes so confusion matrices align with laminar/turbulent.
+    try:
+        needs_remap = mapping is None or len(mapping) <= 1
+        candidate_classes: list[str] = []
+        # Prefer labels_map values
+        if labels_map:
+            candidate_classes = sorted({str(v).strip() for v in labels_map.values() if str(v).strip()})
+        # Else predicted class strings
+        if not candidate_classes:
+            candidate_classes = sorted({r.predicted_class for r in records if r.predicted_class})
+        # Else true_class fields
+        if not candidate_classes:
+            candidate_classes = sorted({r.true_class for r in records if r.true_class})
+        if needs_remap and candidate_classes:
+            # Preserve common ordering when both classes are present
+            if {"turbulent", "laminar"} <= set(c.lower() for c in candidate_classes):
+                ordered = ["turbulent", "laminar"]
+                mapping = {name: i for i, name in enumerate(ordered)}
+            else:
+                mapping = {name: i for i, name in enumerate(candidate_classes)}
+            console.info(f"[reports] using rebuilt class mapping: {mapping}")
+    except Exception as e:
+        console.warn(f"[reports] could not rebuild class mapping: {e}")
     try:
         console.info(f"[reports] loaded predictions from {csv_path} (rows={len(records)})")
     except Exception:
@@ -465,6 +549,13 @@ def main() -> None:
         raise SystemExit("No predictions CSV provided. Pass --csv or set reports.predictions_csv in the config.")
     if image_root is None:
         raise SystemExit("Image root not provided. Pass --image_root or set reports.image_root/test_image_dir in the config.")
+
+    # Allow image_root to be a pointer file (txt/csv) containing the actual directory path
+    if _resolve_root_path_img is not None:
+        try:
+            image_root = _resolve_root_path_img(image_root)
+        except Exception:
+            pass
 
     if not image_root.exists():
         raise SystemExit(f"Image root not found: {image_root}")

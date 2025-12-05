@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple, List
+import time
 
 import numpy as np
 import torch
@@ -827,6 +828,15 @@ class Trainer:
             pass
         history: List[Dict[str, float]] = []
         csv_path, png_path = self._training_progress_paths()
+        # Save a one-time settings snapshot at start of training
+        try:
+            self._write_settings_csv(self._training_settings_path())
+        except Exception:
+            try:
+                self.console.warn("[training] Failed to write training settings snapshot.")
+            except Exception:
+                pass
+        run_start = time.time()
         # Image-mode short-circuit: use image datasets and reuse training loop
         if self._is_image_mode():
             train_loader, val_loader = self._build_image_loaders()
@@ -835,15 +845,18 @@ class Trainer:
             best_path: Path | None = None
             save_path = self._resolve_save_path()
             for epoch in range(1, max_epochs + 1):
+                epoch_start = time.time()
                 tr_loss, tr_acc, tr_mae = self._train_one_epoch(train_loader, epoch)
                 va_loss, va_acc, va_mae = self._eval(val_loader)
+                epoch_time = time.time() - epoch_start
+                total_time = time.time() - run_start
                 if self.is_multitask:
                     self.console.info(
-                        f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} reg_mae={tr_mae:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} reg_mae={va_mae:.4f}"
+                        f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} reg_mae={tr_mae:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} reg_mae={va_mae:.4f} | epoch_time={epoch_time:.2f}s total={total_time/60:.2f}m"
                     )
                 else:
                     self.console.info(
-                        f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f}"
+                        f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} | epoch_time={epoch_time:.2f}s total={total_time/60:.2f}m"
                     )
                 history.append(
                     {
@@ -855,6 +868,8 @@ class Trainer:
                         "train_reg_mae": float(tr_mae),
                         "val_reg_mae": float(va_mae),
                         "lr": float(self._current_lr()),
+                        "epoch_time_sec": float(epoch_time),
+                        "total_time_sec": float(total_time),
                     }
                 )
                 warm = getattr(self.optimizer, "_warmup_scheduler", None)
@@ -875,6 +890,11 @@ class Trainer:
             self._finalize_training_history(history, csv_path, png_path)
             # Also write run log CSV next to the final checkpoint (matching stem)
             self._write_run_log_csv(history, final_path)
+            try:
+                total_time = time.time() - run_start
+                self.console.info(f"[training] Total training time: {total_time:.2f}s ({total_time/60:.2f} min)")
+            except Exception:
+                pass
             return best_path or final_path
 
         # Resolve training/validation fields
@@ -1113,6 +1133,15 @@ class Trainer:
         training_dir.mkdir(parents=True, exist_ok=True)
         return training_dir / "training_history.csv", training_dir / "training_progress.png"
 
+    def _training_settings_path(self) -> Path:
+        cfg_path = Path(self.config.get("_config_path", Path(self.config.get("_config_dir", ".")) / "config.json"))
+        outputs_root = str(self.config.get("outputs_root")) if isinstance(self.config.get("outputs_root"), str) else None
+        resolver = PathResolver(cfg_path, outputs_root=outputs_root)
+        subdir = "image" if self._is_image_mode() else "vector"
+        training_dir = (resolver.outputs_root / subdir / "training").resolve()
+        training_dir.mkdir(parents=True, exist_ok=True)
+        return training_dir / "training_settings.csv"
+
     def _finalize_training_history(self, history: List[Dict[str, float]], csv_path: Path, png_path: Path) -> None:
         if not history:
             return
@@ -1126,6 +1155,10 @@ class Trainer:
             extra_fields.append("train_reg_mae")
         if history and any("val_reg_mae" in h for h in history):
             extra_fields.append("val_reg_mae")
+        if history and any("epoch_time_sec" in h for h in history):
+            extra_fields.append("epoch_time_sec")
+        if history and any("total_time_sec" in h for h in history):
+            extra_fields.append("total_time_sec")
         return base_fields + extra_fields
 
     def _write_training_history_csv(self, history: List[Dict[str, float]], csv_path: Path) -> None:
@@ -1143,6 +1176,29 @@ class Trainer:
         except Exception as e:
             try:
                 self.console.warn(f"[training] Failed to write history CSV: {e}")
+            except Exception:
+                pass
+
+    def _write_settings_csv(self, path: Path) -> None:
+        """Write a CSV snapshot of the training configuration."""
+        try:
+            import csv as _csv
+
+            flat: List[tuple[str, Any]] = []
+            for k, v in sorted(self.config.items(), key=lambda kv: str(kv[0])):
+                if str(k).startswith("_"):
+                    continue
+                flat.append((str(k), v))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = _csv.writer(f)
+                writer.writerow(["key", "value"])
+                for k, v in flat:
+                    writer.writerow([k, v])
+            self.console.success(f"[training] Saved training settings to: {path}")
+        except Exception as e:
+            try:
+                self.console.warn(f"[training] Failed to save settings CSV: {e}")
             except Exception:
                 pass
 
@@ -1167,4 +1223,6 @@ class Trainer:
                 pass
 
     def _plot_training_progress(self, history: List[Dict[str, float]], png_path: Path) -> None:
-        plot_training_progress(history, png_path, console=self.console)
+        model_name = str(self.config.get("model_name", self.config.get("model_type", ""))).strip()
+        title = f"Training Progress - {model_name}" if model_name else "Training Progress"
+        plot_training_progress(history, png_path, console=self.console, title=title)

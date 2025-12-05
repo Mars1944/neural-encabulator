@@ -940,6 +940,7 @@ def plot_training_progress(
     out_png: Path,
     *,
     console=None,
+    title: str | None = None,
 ) -> None:
     """Plot train/val accuracy and loss curves from a history dict list."""
     if not history:
@@ -972,7 +973,7 @@ def plot_training_progress(
         except Exception:
             pass
     ax1.set_ylabel("Accuracy (%)")
-    ax1.set_title("Training Progress")
+    ax1.set_title(title or "Training Progress")
     ax1.grid(alpha=0.3, linestyle="--", linewidth=0.5)
     ax1.legend(loc="lower right")
 

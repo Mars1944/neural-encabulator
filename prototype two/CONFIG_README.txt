@@ -16,9 +16,9 @@ Section: data
 - test_field_path: Vector-field test/validation sources. String, list, or directory/glob. Used by infer.InferenceRunner (and Trainer as validation when present).
 - train_data_kind: Data type for training: "vector" or "image". Controls Trainer loading path.
 - test_data_kind: Data type for inference: "vector" or "image". Controls InferenceRunner path.
-- train_image_dir: Root directory for image training. Expects subfolders per class. Used by image_data.ImageFolderDataset (Trainer).
+- train_image_dir: Root directory for image training. Expects subfolders per class, or a pointer .txt/.csv containing the real path. Used by image_data.ImageFolderDataset (Trainer) and PairedFlowDataset.
 - val_image_dir: Optional root directory for image validation. If empty, Trainer splits train_image_dir by val_split.
-- test_image_dir: Root directory for image inference (folder-per-class, but ground truth not required). Used by infer.run_image_inference.
+- test_image_dir: Root directory for image inference (folder-per-class, but ground truth not required). Accepts pointer .txt/.csv containing the real path. Used by infer.run_image_inference.
 - image_size: [H, W] resize for images. Used by image_data and image inference.
 - image_channels: 1 or 3; converts images to grayscale or RGB and sets model input channels. Used by image_data, infer, and main.ModelManager.
 - tile_size: [H, W] for vector tiling. Used by vector_field_data and consumed by trainer/infer.
@@ -49,6 +49,8 @@ Section: training
 - train_source_labels: Optional per-source labels when providing multiple vector-field inputs. Used by trainer.Trainer to assign labels when embedded labels are absent.
 - val_source_labels: Same as above for validation sources.
 - training_history_csv: Optional override path for training history CSV; defaults to outputs_root/<subdir>/training/training_history.csv. Used by trainer.Trainer and reports plotting helper.
+- training_settings: Not a config key, but trainer writes a snapshot CSV of config keys to outputs_root/<subdir>/training/training_settings.csv at start.
+- Timing fields: training history/log CSVs include epoch_time_sec and total_time_sec per epoch.
 
 Section: inference
 - use_test: When true, inference chooses test inputs by default; train overrides this to False for building models. Read by main.ModelManager and train.py.
@@ -80,6 +82,7 @@ Section: viewer
 Image-mode settings (extra details)
 - image_mean, image_std: Per-channel normalization (values in [0,1] scale). If one value is given, it is broadcast to all channels.
 - augment: Optional augmentation flags for image training, e.g., {"flip": true, "rotate": true}. Used by image_data.ImageFolderDataset.
+- Imputation logging: PairedFlowDataset will impute missing digits/velocity/Re using last seen values; when more than 10 imputations occur, details are saved to <metadata_stem>_impute_warnings.csv (and a single warning is printed).
 
 Notes
 - Path resolution: common.ConfigManager anchors relative paths to the config file directory so you can keep portable configs.

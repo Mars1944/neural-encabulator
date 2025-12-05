@@ -16,8 +16,8 @@
 
   "data": {
     "data_kind": "image",
-    "train_image_dir": "C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/large_data_holding/outputs/outputs/cropped_masks",
-    "test_image_dir": "data/testing data/test set/set one",
+    "train_image_dir": "data/training data/image/training_image_root.txt",
+    "test_image_dir": "data/testing data/testing_image_root.txt",
     "image_size": [256, 256],
     "image_channels": 3,
     "tile_size": [256, 256],
@@ -39,8 +39,8 @@
 
   "training": {
     "task": "multitask",
-    "train_flow_csv": "data/training data/image/large_data_set/metadata.csv",
-    "debug_limit_training": true,
+    "train_flow_csv": "C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/training data/metadata_set_one.csv",
+    "debug_limit_training": false,
     "debug_train_fraction": 0.2,
     "batch_size": 16,
     "num_workers": 0,
@@ -51,7 +51,7 @@
     "weight_decay": 0.0,
     "optimizer": "adamw",
     "scheduler": "none",
-    "max_epochs": 4,
+    "max_epochs": 50,
     "train_source_labels": [2, 1]
   },
 
@@ -59,7 +59,7 @@
     "common": {
       "data_kind": "image",
       "use_test": true,
-      "file_labels": "data/testing data/file_name.csv",
+      "file_labels": "C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/testing_data/file_name.csv",
       "file_summary": "data/outputs/image/file_predictions.csv",
       "recurse": true,
       "generate_heatmap": true,
@@ -80,7 +80,7 @@
       "allow_tf32": true,
       "use_opencv_loader": false,
       "plot_top_n": 50,
-      "image_include_classes": ["mixed"]
+      "image_include_classes": []
     },
     "image": {
       "image_infer_batch_size": 32
@@ -93,7 +93,7 @@
 
   "reports": {
     "predictions_csv": "data/outputs/image/file_predictions.csv",
-    "image_root": "data/testing data/image",
+    "image_root": "data/testing data/testing_image_root.txt",
     "subdir": "image",
     "cm_csv": "data/outputs/image/confusion_matrix.csv",
     "cm_png": "data/outputs/image/confusion_matrix.png"

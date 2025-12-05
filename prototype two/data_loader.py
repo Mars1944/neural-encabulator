@@ -308,6 +308,8 @@ class PairedFlowDataset(torch.utils.data.Dataset[Dict[str, torch.Tensor]]):
         last_re: Optional[float] = None
         last_digits: Optional[float] = None
         imputed_count = 0
+        impute_warnings: list[tuple[str, str, float]] = []
+        impute_messages: list[str] = []
         for r in rows:
             frame_idx = str(r.get("frame_index", "")).strip()
             if not frame_idx:
@@ -331,13 +333,13 @@ class PairedFlowDataset(torch.utils.data.Dataset[Dict[str, torch.Tensor]]):
             if missing_v and last_velocity is not None:
                 velocity = float(last_velocity)
                 imputed_count += 1
-                if console is not None:
-                    console.warn(f"[impute] velocity missing at frame {frame_idx}; using last value {velocity}")
+                impute_messages.append(f"[impute] velocity missing at frame {frame_idx}; using last value {velocity}")
+                impute_warnings.append((frame_idx, "velocity", float(velocity)))
             if missing_r and last_re is not None:
                 reynolds = float(last_re)
                 imputed_count += 1
-                if console is not None:
-                    console.warn(f"[impute] Reynolds missing at frame {frame_idx}; using last value {reynolds}")
+                impute_messages.append(f"[impute] Reynolds missing at frame {frame_idx}; using last value {reynolds}")
+                impute_warnings.append((frame_idx, "reynolds_number", float(reynolds)))
             if np.isnan(velocity) or np.isnan(reynolds):
                 dropped += 1
                 continue
@@ -352,8 +354,8 @@ class PairedFlowDataset(torch.utils.data.Dataset[Dict[str, torch.Tensor]]):
             if digits_val is None and last_digits is not None:
                 digits_val = float(last_digits)
                 imputed_count += 1
-                if console is not None:
-                    console.warn(f"[impute] digits missing at frame {frame_idx}; using last value {digits_val}")
+                impute_messages.append(f"[impute] digits missing at frame {frame_idx}; using last value {digits_val}")
+                impute_warnings.append((frame_idx, "digits", float(digits_val)))
             if digits_val is not None:
                 last_digits = digits_val
 
@@ -394,6 +396,23 @@ class PairedFlowDataset(torch.utils.data.Dataset[Dict[str, torch.Tensor]]):
                 console.warn("Dataset drop/flag: rows without images or images without rows were ignored for pairing.")
             if imputed_count > 0:
                 console.warn(f"Imputed {imputed_count} missing numeric fields using last observed values.")
+            if len(impute_warnings) > 10:
+                try:
+                    import csv as _csv
+
+                    warn_path = self.csv_path.with_name(f"{self.csv_path.stem}_impute_warnings.csv")
+                    warn_path.parent.mkdir(parents=True, exist_ok=True)
+                    with warn_path.open("w", newline="", encoding="utf-8") as f:
+                        w = _csv.writer(f)
+                        w.writerow(["frame_index", "field", "value_used"])
+                        for frame_idx, field, value in impute_warnings:
+                            w.writerow([frame_idx, field, value])
+                    console.warn(f"[impute] Many imputations detected; details saved to {warn_path}")
+                except Exception as e:
+                    console.warn(f"[impute] Failed to save imputation warnings CSV: {e}")
+            else:
+                for msg in impute_messages:
+                    console.warn(msg)
         if not self.items:
             raise RuntimeError("No paired samples found; check frame_index naming between images and CSV.")
 

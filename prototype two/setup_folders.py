@@ -51,10 +51,8 @@ def collect_dirs(cfg: Dict, base_dir: Path) -> Set[Path]:
 
     inf = cfg.get("inference", {}) if isinstance(cfg.get("inference"), dict) else {}
     inf_common = inf.get("common", {}) if isinstance(inf.get("common"), dict) else {}
-    for key in ("file_labels", "file_summary", "cm_csv", "cm_png", "heatmaps_dir", "stitched_heatmap"):
+    for key in ("file_labels", "file_summary", "cm_csv", "cm_png"):
         _add_path(inf_common.get(key), base_dir, dirs)
-    # Heatmaps dir defaults to outputs_root/heatmaps; ensure that exists
-    _add_path(str(outputs_root / "heatmaps"), base_dir, dirs)
 
     reports_cfg = cfg.get("reports", {}) if isinstance(cfg.get("reports"), dict) else {}
     for key in ("predictions_csv", "image_root", "cm_csv", "cm_png"):
@@ -73,7 +71,6 @@ def collect_dirs(cfg: Dict, base_dir: Path) -> Set[Path]:
     # Outputs subfolders commonly used
     dirs.add(outputs_root / "image")
     dirs.add(outputs_root / "image" / "plots")
-    dirs.add(outputs_root / "vector")
 
     return dirs
 

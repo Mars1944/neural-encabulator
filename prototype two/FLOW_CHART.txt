@@ -52,11 +52,13 @@ Training path
 |train.py| --> | main.py: ConfigManager        |-------------------->| trainer.py: Trainer  |
 +--------+     | + ModelManager                |                     | - builds loaders     |
                +-------------------------------+                     | - calls CnnOptim     |
-                                                                     | - trains/validates   |
-                                                                     | - saves checkpoints  |
-                                                                     | - writes history CSV |
-                                                                     |   + progress plot    |
-                                                                     +----------------------+
+                                                                    | - trains/validates   |
+                                                                    | - saves checkpoints  |
+                                                                    | - writes training_settings.csv|
+                                                                    | - writes history CSV |
+                                                                    |   (with epoch/total time)    |
+                                                                    |   + progress plot    |
+                                                                    +----------------------+
                                                                                |
                                                                                | torch.save
                                                                                v
