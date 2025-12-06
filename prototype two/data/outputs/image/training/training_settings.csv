@@ -1,8 +1,8 @@
 key,value
 add_magnitude,True
 allow_tf32,True
-batch_size,16
-channels_last,True
+batch_size,48
+channels_last,False
 class_names,"['turbulent', 'laminar']"
 cm_csv,data/outputs/image/confusion_matrix.csv
 cm_png,data/outputs/image/confusion_matrix.png
@@ -32,16 +32,16 @@ kernel_size,3
 learning_rate,0.001
 limit_tiles,
 max_epochs,50
-mixed_precision,fp16
+mixed_precision,False
 model,"{'num_classes': 2, 'conv_channels': [32, 64, 128, 256], 'kernel_size': 3, 'pool_every': 1, 'dropout': 0.1, 'use_batchnorm': True, 'dilations': [1, 2, 4, 4]}"
 model_type,cnn
 normalize,True
 num_classes,2
-num_workers,0
+num_workers,4
 optimizer,adamw
 outputs_root,data/outputs
 paths,{'outputs_root': 'data/outputs'}
-pin_memory,False
+pin_memory,True
 plot_top_n,50
 pool_every,1
 predictions_csv,data/outputs/image/file_predictions.csv
@@ -61,7 +61,7 @@ torch_compile,False
 train_flow_csv,C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/training data/metadata_set_one.csv
 train_image_dir,C:\Users\Owner\Documents\Grad School\Fall 2025\ME 521 - CPTS 534 Project\neural-encabulator\prototype two\data\training data\image\training_image_root.txt
 train_source_labels,"[2, 1]"
-training,"{'task': 'multitask', 'train_flow_csv': 'C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/training data/metadata_set_one.csv', 'debug_limit_training': False, 'debug_train_fraction': 0.2, 'batch_size': 16, 'num_workers': 0, 'pin_memory': False, 'val_source_labels': [0, 1], 'val_split': 0.2, 'learning_rate': 0.001, 'weight_decay': 0.0, 'optimizer': 'adamw', 'scheduler': 'none', 'max_epochs': 50, 'train_source_labels': [2, 1]}"
+training,"{'task': 'multitask', 'train_flow_csv': 'C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/training data/metadata_set_one.csv', 'debug_limit_training': False, 'debug_train_fraction': 0.2, 'batch_size': 48, 'num_workers': 4, 'pin_memory': True, 'mixed_precision': False, 'channels_last': False, 'val_source_labels': [0, 1], 'val_split': 0.2, 'learning_rate': 0.001, 'weight_decay': 0.0, 'optimizer': 'adamw', 'scheduler': 'none', 'max_epochs': 50, 'train_source_labels': [2, 1]}"
 use_batchnorm,True
 use_inference_mode,True
 use_opencv_loader,False

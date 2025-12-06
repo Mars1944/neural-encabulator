@@ -6,6 +6,8 @@ import time
 
 import numpy as np
 import torch
+import torch.amp as torch_amp
+from torch.cuda.amp import GradScaler as CudaGradScaler
 
 from vector_field_data import (
     ensure_chw,
@@ -100,6 +102,17 @@ class Trainer:
             self.config["_config_dir"] = str(Path(self.config["_config_path"]).parent)
         self.device = device
         self.model = model.to(device)
+        # AMP / memory format settings
+        mp_cfg = str(self.config.get("mixed_precision", "")).lower()
+        self.amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mp_cfg, None)
+        self.use_amp = bool(self.amp_dtype) and self.device.type == "cuda"
+        self.grad_scaler = CudaGradScaler(enabled=self.use_amp)
+        self._use_channels_last = bool(self.config.get("channels_last", False)) and self.device.type == "cuda"
+        if self._use_channels_last:
+            try:
+                self.model = self.model.to(memory_format=torch.channels_last)
+            except Exception:
+                self._use_channels_last = False
         task = str(self.config.get("task", "")).lower()
         flow_csv_present = bool(self.config.get("train_flow_csv") or self.config.get("flow_csv"))
         self.is_multitask = task.startswith("multi") or bool(self.config.get("multitask", False)) or flow_csv_present
@@ -136,7 +149,8 @@ class Trainer:
         # Vector path removed; force image mode
         return True
 
-    def _flow_collate(self, batch):
+    @staticmethod
+    def _flow_collate(batch):
         xs = [b[0] for b in batch]
         targets = [b[1] for b in batch]
         x = torch.stack(xs, dim=0)
@@ -252,8 +266,8 @@ class Trainer:
                 n_keep = max(1, int(len(ds_train) * limit_frac))
                 ds_train = torch.utils.data.Subset(ds_train, list(range(n_keep)))
                 self.console.warn(f"[debug] Limiting training samples to {n_keep} ({limit_frac*100:.1f}%) for quick run.")
-            train_loader = torch.utils.data.DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=self._flow_collate)
-            val_loader = torch.utils.data.DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory, collate_fn=self._flow_collate)
+            train_loader = torch.utils.data.DataLoader(ds_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=Trainer._flow_collate)
+            val_loader = torch.utils.data.DataLoader(ds_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory, collate_fn=Trainer._flow_collate)
             return train_loader, val_loader
 
         try:
@@ -709,6 +723,7 @@ class Trainer:
         total_correct = 0
         total_seen = 0
         total_reg_mae = 0.0
+        non_blocking = bool(self.config.get("pin_memory", False))
         bar = None
         try:
             from tqdm import tqdm as _tqdm  # type: ignore
@@ -718,31 +733,46 @@ class Trainer:
         iter_loader = bar if bar is not None else loader
         for batch in iter_loader:
             x, y = batch
-            x = x.to(self.device)
-            self.optimizer.zero_grad()
+            if self._use_channels_last:
+                x = x.to(self.device, non_blocking=non_blocking, memory_format=torch.channels_last)
+            else:
+                x = x.to(self.device, non_blocking=non_blocking)
+            self.optimizer.zero_grad(set_to_none=True)
             if self.is_multitask:
-                logits_reg = self.model(x)
-                logits = logits_reg["logits"]
-                reg = logits_reg["reg"]
-                labels = y["label"].to(self.device)
-                reg_tgt = torch.stack([y["velocity"], y["reynolds"]], dim=1).to(self.device)
-                loss_cls = self.criterion(logits, labels)
-                loss_reg = self.reg_loss(reg, reg_tgt)
-                loss = self.loss_w_cls * loss_cls + self.loss_w_reg * loss_reg
-                loss.backward()
-                self.optimizer.step()
+                labels = y["label"].to(self.device, non_blocking=non_blocking)
+                reg_tgt = torch.stack([y["velocity"], y["reynolds"]], dim=1).to(self.device, non_blocking=non_blocking)
+                with torch_amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                    logits_reg = self.model(x)
+                    logits = logits_reg["logits"]
+                    reg = logits_reg["reg"]
+                    loss_cls = self.criterion(logits, labels)
+                    loss_reg = self.reg_loss(reg, reg_tgt)
+                    loss = self.loss_w_cls * loss_cls + self.loss_w_reg * loss_reg
+                if self.use_amp:
+                    self.grad_scaler.scale(loss).backward()
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
                 with torch.no_grad():
                     pred = torch.argmax(logits, dim=1)
                     total_correct += int((pred == labels).sum().item())
                     total_seen += int(labels.numel())
                     total_loss += float(loss.item()) * int(labels.size(0))
-                    total_reg_mae += float(torch.abs(reg - reg_tgt).sum().item())
+                    total_reg_mae += float(torch.abs(reg.float() - reg_tgt.float()).sum().item())
             else:
-                y = y.to(self.device)
-                logits = self.model(x)
-                loss = self.criterion(logits, y)
-                loss.backward()
-                self.optimizer.step()
+                y = y.to(self.device, non_blocking=non_blocking)
+                with torch_amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                    logits = self.model(x)
+                    loss = self.criterion(logits, y)
+                if self.use_amp:
+                    self.grad_scaler.scale(loss).backward()
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
                 with torch.no_grad():
                     pred = torch.argmax(logits, dim=1)
                     total_correct += int((pred == y).sum().item())
@@ -771,6 +801,7 @@ class Trainer:
         total_correct = 0
         total_seen = 0
         total_reg_mae = 0.0
+        non_blocking = bool(self.config.get("pin_memory", False))
         bar = None
         try:
             from tqdm import tqdm as _tqdm  # type: ignore
@@ -780,25 +811,30 @@ class Trainer:
         iter_loader = bar if bar is not None else loader
         for batch in iter_loader:
             x, y = batch
-            x = x.to(self.device)
+            if self._use_channels_last:
+                x = x.to(self.device, non_blocking=non_blocking, memory_format=torch.channels_last)
+            else:
+                x = x.to(self.device, non_blocking=non_blocking)
             if self.is_multitask:
-                logits_reg = self.model(x)
-                logits = logits_reg["logits"]
-                reg = logits_reg["reg"]
-                labels = y["label"].to(self.device)
-                reg_tgt = torch.stack([y["velocity"], y["reynolds"]], dim=1).to(self.device)
-                loss_cls = self.criterion(logits, labels)
-                loss_reg = self.reg_loss(reg, reg_tgt)
-                loss = self.loss_w_cls * loss_cls + self.loss_w_reg * loss_reg
+                labels = y["label"].to(self.device, non_blocking=non_blocking)
+                reg_tgt = torch.stack([y["velocity"], y["reynolds"]], dim=1).to(self.device, non_blocking=non_blocking)
+                with torch_amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                    logits_reg = self.model(x)
+                    logits = logits_reg["logits"]
+                    reg = logits_reg["reg"]
+                    loss_cls = self.criterion(logits, labels)
+                    loss_reg = self.reg_loss(reg, reg_tgt)
+                    loss = self.loss_w_cls * loss_cls + self.loss_w_reg * loss_reg
                 pred = torch.argmax(logits, dim=1)
                 total_correct += int((pred == labels).sum().item())
                 total_seen += int(labels.numel())
                 total_loss += float(loss.item()) * int(labels.size(0))
-                total_reg_mae += float(torch.abs(reg - reg_tgt).sum().item())
+                total_reg_mae += float(torch.abs(reg.float() - reg_tgt.float()).sum().item())
             else:
-                y = y.to(self.device)
-                logits = self.model(x)
-                loss = self.criterion(logits, y)
+                y = y.to(self.device, non_blocking=non_blocking)
+                with torch_amp.autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                    logits = self.model(x)
+                    loss = self.criterion(logits, y)
                 pred = torch.argmax(logits, dim=1)
                 total_correct += int((pred == y).sum().item())
                 total_seen += int(y.numel())
@@ -845,19 +881,24 @@ class Trainer:
             best_path: Path | None = None
             save_path = self._resolve_save_path()
             for epoch in range(1, max_epochs + 1):
+                try:
+                    if self.device.type == "cuda":
+                        torch.cuda.reset_peak_memory_stats(self.device)
+                except Exception:
+                    pass
                 epoch_start = time.time()
                 tr_loss, tr_acc, tr_mae = self._train_one_epoch(train_loader, epoch)
                 va_loss, va_acc, va_mae = self._eval(val_loader)
                 epoch_time = time.time() - epoch_start
                 total_time = time.time() - run_start
+                mem = self._cuda_mem_stats()
                 if self.is_multitask:
-                    self.console.info(
-                        f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} reg_mae={tr_mae:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} reg_mae={va_mae:.4f} | epoch_time={epoch_time:.2f}s total={total_time/60:.2f}m"
-                    )
+                    msg = f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} reg_mae={tr_mae:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} reg_mae={va_mae:.4f} | epoch_time={epoch_time:.2f}s total={total_time/60:.2f}m"
                 else:
-                    self.console.info(
-                        f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} | epoch_time={epoch_time:.2f}s total={total_time/60:.2f}m"
-                    )
+                    msg = f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} | epoch_time={epoch_time:.2f}s total={total_time/60:.2f}m"
+                if mem:
+                    msg += f" | cuda_mem alloc={mem.get('cuda_mem_alloc_mb', 0.0):.1f}MB peak={mem.get('cuda_mem_peak_mb', 0.0):.1f}MB reserved={mem.get('cuda_mem_reserved_mb', 0.0):.1f}MB"
+                self.console.info(msg)
                 history.append(
                     {
                         "epoch": int(epoch),
@@ -870,6 +911,7 @@ class Trainer:
                         "lr": float(self._current_lr()),
                         "epoch_time_sec": float(epoch_time),
                         "total_time_sec": float(total_time),
+                        **mem,
                     }
                 )
                 warm = getattr(self.optimizer, "_warmup_scheduler", None)
@@ -1048,11 +1090,21 @@ class Trainer:
         save_path = self._resolve_save_path()
 
         for epoch in range(1, max_epochs + 1):
+            try:
+                if self.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(self.device)
+            except Exception:
+                pass
+            epoch_start = time.time()
             tr_loss, tr_acc = self._train_one_epoch(train_loader, epoch)
             va_loss, va_acc = self._eval(val_loader)
-            self.console.info(
-                f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f}"
-            )
+            epoch_time = time.time() - epoch_start
+            mem = self._cuda_mem_stats()
+            msg = f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f}"
+            msg += f" | epoch_time={epoch_time:.2f}s"
+            if mem:
+                msg += f" | cuda_mem alloc={mem.get('cuda_mem_alloc_mb', 0.0):.1f}MB peak={mem.get('cuda_mem_peak_mb', 0.0):.1f}MB reserved={mem.get('cuda_mem_reserved_mb', 0.0):.1f}MB"
+            self.console.info(msg)
             history.append(
                 {
                     "epoch": int(epoch),
@@ -1061,6 +1113,8 @@ class Trainer:
                     "val_loss": float(va_loss),
                     "val_acc": float(va_acc),
                     "lr": float(self._current_lr()),
+                    "epoch_time_sec": float(epoch_time),
+                    **mem,
                 }
             )
 
@@ -1123,6 +1177,22 @@ class Trainer:
         except Exception:
             return 0.0
 
+    def _cuda_mem_stats(self) -> Dict[str, float]:
+        """Return current/peak CUDA memory stats in MB (empty dict if not on CUDA)."""
+        try:
+            if self.device.type != "cuda" or not torch.cuda.is_available():
+                return {}
+            alloc = float(torch.cuda.memory_allocated(self.device)) / (1024.0 * 1024.0)
+            reserved = float(torch.cuda.memory_reserved(self.device)) / (1024.0 * 1024.0)
+            peak = float(torch.cuda.max_memory_allocated(self.device)) / (1024.0 * 1024.0)
+            return {
+                "cuda_mem_alloc_mb": alloc,
+                "cuda_mem_reserved_mb": reserved,
+                "cuda_mem_peak_mb": peak,
+            }
+        except Exception:
+            return {}
+
     def _training_progress_paths(self) -> Tuple[Path, Path]:
         # Keep training artifacts under outputs_root/<data_kind>/training/*
         cfg_path = Path(self.config.get("_config_path", Path(self.config.get("_config_dir", ".")) / "config.json"))
@@ -1159,6 +1229,12 @@ class Trainer:
             extra_fields.append("epoch_time_sec")
         if history and any("total_time_sec" in h for h in history):
             extra_fields.append("total_time_sec")
+        if history and any("cuda_mem_alloc_mb" in h for h in history):
+            extra_fields.append("cuda_mem_alloc_mb")
+        if history and any("cuda_mem_reserved_mb" in h for h in history):
+            extra_fields.append("cuda_mem_reserved_mb")
+        if history and any("cuda_mem_peak_mb" in h for h in history):
+            extra_fields.append("cuda_mem_peak_mb")
         return base_fields + extra_fields
 
     def _write_training_history_csv(self, history: List[Dict[str, float]], csv_path: Path) -> None:

@@ -280,17 +280,53 @@ def _generate_plots(
     plots_dir = (base_dir / "plots").resolve()
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    # Regression plots (velocity, Reynolds) if predictions are present
+    # Regression plots (velocity, Reynolds) with optional rolling average
     vel_vals = [r.velocity_pred for r in records if r.velocity_pred is not None]
     re_vals = [r.reynolds_pred for r in records if r.reynolds_pred is not None]
+
+    def _rolling_mean(arr: List[float], window: int = 3) -> List[float]:
+        if window <= 1 or len(arr) < window:
+            return arr
+        out: List[float] = []
+        cumsum = np.cumsum([0.0] + arr, dtype=float)
+        for i in range(window, len(arr) + 1):
+            out.append(float((cumsum[i] - cumsum[i - window]) / window))
+        # align to original length by padding the first (window-1) entries with leading values
+        if out:
+            pad = [out[0]] * (window - 1)
+            return pad + out
+        return arr
+
     if vel_vals:
         try:
+            vel_avg = _rolling_mean(vel_vals, window=3)
+            vel_avg10 = _rolling_mean(vel_vals, window=10)
+            vel_avg100 = _rolling_mean(vel_vals, window=100)
+            x_vals = list(range(1, len(vel_vals) + 1))
+            fit_100 = None
+            if len(vel_vals) >= 100:
+                try:
+                    x_arr = np.arange(1, len(vel_avg100) + 1, dtype=float)
+                    y_arr = np.asarray(vel_avg100, dtype=float)
+                    # 8th-order polynomial fit on the 100-pt average
+                    coeffs = np.polyfit(x_arr, y_arr, deg=8)
+                    fit_100 = np.polyval(coeffs, x_arr)
+                except Exception:
+                    fit_100 = None
             _plt.figure(figsize=(6, 4))
-            _plt.plot(range(1, len(vel_vals) + 1), vel_vals, color="#2C7BB6", linewidth=1.2)
+            _plt.plot(x_vals, vel_vals, color="#2C7BB6", linewidth=1.0, alpha=0.6, label="velocity (pred)")
+            _plt.plot(x_vals, vel_avg, color="#1B4F72", linewidth=1.4, label="3-pt avg")
+            if len(vel_vals) >= 10:
+                _plt.plot(x_vals, vel_avg10, color="#0B3C5D", linewidth=1.2, linestyle="--", label="10-pt avg")
+            if len(vel_vals) >= 100:
+                _plt.plot(x_vals, vel_avg100, color="#062133", linewidth=1.0, linestyle=":", label="100-pt avg")
+            if fit_100 is not None:
+                _plt.plot(x_vals, fit_100, color="#FFD700", linewidth=1.2, linestyle="-.", label="100-pt fit (8th)")
             _plt.xlabel("image index")
             _plt.ylabel("velocity (predicted)")
             _plt.title("Predicted velocity")
             _plt.grid(alpha=0.3, linestyle="--", linewidth=0.5)
+            _plt.legend()
             out_vel = plots_dir / "velocity_predictions.png"
             console.info(f"[reports] plotting velocity predictions -> {out_vel}")
             _plt.tight_layout()
@@ -300,12 +336,33 @@ def _generate_plots(
             console.warn(f"[reports] failed to plot velocity predictions: {e}")
     if re_vals:
         try:
+            re_avg = _rolling_mean(re_vals, window=3)
+            re_avg10 = _rolling_mean(re_vals, window=10)
+            re_avg100 = _rolling_mean(re_vals, window=100)
+            x_vals = list(range(1, len(re_vals) + 1))
+            fit_100 = None
+            if len(re_vals) >= 100:
+                try:
+                    x_arr = np.arange(1, len(re_avg100) + 1, dtype=float)
+                    y_arr = np.asarray(re_avg100, dtype=float)
+                    coeffs = np.polyfit(x_arr, y_arr, deg=8)
+                    fit_100 = np.polyval(coeffs, x_arr)
+                except Exception:
+                    fit_100 = None
             _plt.figure(figsize=(6, 4))
-            _plt.plot(range(1, len(re_vals) + 1), re_vals, color="#D9534F", linewidth=1.2)
+            _plt.plot(x_vals, re_vals, color="#D9534F", linewidth=1.0, alpha=0.6, label="Re (pred)")
+            _plt.plot(x_vals, re_avg, color="#A52A2A", linewidth=1.4, label="3-pt avg")
+            if len(re_vals) >= 10:
+                _plt.plot(x_vals, re_avg10, color="#7B241C", linewidth=1.2, linestyle="--", label="10-pt avg")
+            if len(re_vals) >= 100:
+                _plt.plot(x_vals, re_avg100, color="#4A0D0D", linewidth=1.0, linestyle=":", label="100-pt avg")
+            if fit_100 is not None:
+                _plt.plot(x_vals, fit_100, color="#FFD700", linewidth=1.2, linestyle="-.", label="100-pt fit (8th)")
             _plt.xlabel("image index")
             _plt.ylabel("Reynolds number (predicted)")
             _plt.title("Predicted Reynolds number")
             _plt.grid(alpha=0.3, linestyle="--", linewidth=0.5)
+            _plt.legend()
             out_re = plots_dir / "reynolds_predictions.png"
             console.info(f"[reports] plotting Reynolds predictions -> {out_re}")
             _plt.tight_layout()
