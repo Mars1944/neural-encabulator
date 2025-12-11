@@ -281,6 +281,7 @@ class PairedFlowDataset(torch.utils.data.Dataset[Dict[str, torch.Tensor]]):
         split_filter: Optional[str] = None,
         laminar_threshold: float = 2300.0,
         console: Optional[Any] = None,
+        normalize_targets: bool = False,
     ) -> None:
         super().__init__()
         self.root = _resolve_root_path(image_root)
@@ -297,6 +298,8 @@ class PairedFlowDataset(torch.utils.data.Dataset[Dict[str, torch.Tensor]]):
         self.augment = augment or {}
         self.split_filter = split_filter.lower() if isinstance(split_filter, str) else None
         self.laminar_threshold = float(laminar_threshold)
+        self.normalize_targets = bool(normalize_targets)
+        self._reg_norm: Optional[Dict[str, float]] = None
 
         rows = _read_flow_metadata(self.csv_path)
         img_map = _index_images(self.root, exts={".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"})
@@ -416,6 +419,26 @@ class PairedFlowDataset(torch.utils.data.Dataset[Dict[str, torch.Tensor]]):
         if not self.items:
             raise RuntimeError("No paired samples found; check frame_index naming between images and CSV.")
 
+        # Optional regression target normalization (standardize velocity/Re to stabilize loss scale)
+        if self.normalize_targets:
+            try:
+                velocities = np.array([it["velocity"] for it in self.items], dtype=np.float64)
+                reynolds_vals = np.array([it["reynolds_number"] for it in self.items], dtype=np.float64)
+                v_mean = float(np.mean(velocities))
+                v_std = float(np.std(velocities) + 1e-6)
+                r_mean = float(np.mean(reynolds_vals))
+                r_std = float(np.std(reynolds_vals) + 1e-6)
+                self._reg_norm = {
+                    "v_mean": v_mean,
+                    "v_std": v_std,
+                    "r_mean": r_mean,
+                    "r_std": r_std,
+                }
+                if console is not None:
+                    console.info(f"[reg_norm] velocity mean/std=({v_mean:.3f},{v_std:.3f}) reynolds mean/std=({r_mean:.3f},{r_std:.3f})")
+            except Exception:
+                self._reg_norm = None
+
     def __len__(self) -> int:
         return len(self.items)
 
@@ -437,10 +460,15 @@ class PairedFlowDataset(torch.utils.data.Dataset[Dict[str, torch.Tensor]]):
         arr = self._maybe_augment(arr)
         arr = _normalize(arr, mean=self.mean, std=self.std)
         x = torch.from_numpy(arr.astype(np.float32))
+        vel = float(item["velocity"])
+        reynolds = float(item["reynolds_number"])
+        if self._reg_norm is not None:
+            vel = (vel - self._reg_norm["v_mean"]) / self._reg_norm["v_std"]
+            reynolds = (reynolds - self._reg_norm["r_mean"]) / self._reg_norm["r_std"]
         target: Dict[str, torch.Tensor | str] = {
             "label": torch.tensor(int(item["label"]), dtype=torch.long),
-            "velocity": torch.tensor(float(item["velocity"]), dtype=torch.float32),
-            "reynolds_number": torch.tensor(float(item["reynolds_number"]), dtype=torch.float32),
+            "velocity": torch.tensor(vel, dtype=torch.float32),
+            "reynolds_number": torch.tensor(reynolds, dtype=torch.float32),
             "frame_index": item["frame_index"],
             "path": str(item["path"]),
             "split": item["split"],

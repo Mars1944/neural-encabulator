@@ -267,6 +267,7 @@ class ConfigManager:
             "_tips": "any",
             "optimizer": "str",
             "scheduler": "str",
+            "scheduler_params": "dict",
             "max_epochs": "int",
             "save_weights": "str",
             "train_field_path": "str",
@@ -305,6 +306,7 @@ class ConfigManager:
             "viewer": "dict",
             "reports": "dict",
             "outputs_root": "str",
+            "mcp": "dict",
             # Directory expansion / discovery
             "recurse": "bool",
             "generate_heatmap": "bool",
@@ -368,9 +370,13 @@ class ConfigManager:
             "multitask": "bool",
             "train_flow_csv": "str",
             "flow_csv": "str",
+            "loss_weight_cls": "float",
+            "loss_weight_reg": "float",
             "debug_limit_training": "bool",
             "debug_train_fraction": "float",
             "max_train_fraction": "float",
+            "normalize_regression_targets": "bool",
+            "regression_norm": "dict",
 
         }
         for k in list(config.keys()):

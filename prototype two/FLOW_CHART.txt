@@ -3,135 +3,99 @@ Prototype Two Flow (ASCII)
 Root: example_files/prototype two
 Outputs: data/outputs (via paths.outputs_root in config.json)
 
-Core config and utilities
+Overall pipeline flow (how blocks connect)
 
-+------------------+            read by            +-------------------------------+
-| config.json      | <-----------------------------| common.ConfigManager          |
-+------------------+                               | - loads/merges sections       |
-                                                   | - selects device, sets seed   |
-                                                   | - normalizes defaults         |
-                                                   | - ensure_outputs_ready hook   |
+config.json --> common.ConfigManager --> PathResolver
+    |                                \
+    |                                 -> ensure_outputs_ready/setup_folders (shared dirs)
+    v
+ModelManager (builds cnn_model.SimpleCNN/MultiTaskCNN) --> Trainer.fit
+    |                                                               \
+    |                                                                -> checkpoints/history under outputs_root
+    v
+InferenceRunner (infer.py) reads checkpoints + config --> produces heatmaps/NPY/stats
+    |
+    v
+reports.py (confusion matrices/summary CSVs) and optional heatmap_viewer.py stitching
+
+CNN core (model + optimization)
+
++-----------------------+    used by    +----------------------+    used by    +--------------------+
+| cnn_model.py          | <-----------  | trainer.py           | -----------> | cnn_optim.py       |
+| - SimpleCNN/MultiTask |               | - builds model       |              | - CnnOptim.build() |
+| - ConvBlock           |               | - channels_last/AMP  |              |   -> optimizer,    |
+| - count_parameters    |               |                      |              |      scheduler     |
++-----------------------+               +----------------------+              +--------------------+
+
+Support code (config, paths, data)
+
++------------------+    read by    +-------------------------------+
+| config.json      | <-----------  | common.ConfigManager          |
++------------------+               | - merges sections, seeds      |
+                                   | - selects device              |
+                                   | - ensure_outputs_ready hook   |
+                                   +-------------------------------+
+                                              |
+                                              v
+                                   +-------------------------------+
+                                   | common.PathResolver           |
+                                   | - anchors relative paths      |
+                                   | - derives outputs_root dirs   |
+                                   +-------------------------------+
+                                              |
+                                              v
+                                   +-------------------------------+
+                                   | vector_field_data.py /        |
+                                   | data_loader.py                |
+                                   | - load tiles or images        |
+                                   | - dataset/label helpers       |
+                                   +-------------------------------+
+
+Training/validation loop
+
+   CLI                builds model + config           trains/validates/checkpoints
++--------+    +-------------------------------+    +-------------------------------+
+|train.py| -> | main.py + ModelManager        | -> | trainer.Trainer.fit           |
++--------+    +-------------------------------+    | - dataloaders (image/multitask|
+                                                   |   with optional val split)    |
+                                                   | - loss: CrossEntropy +        |
+                                                   |   optional regression (MSE)   |
+                                                   | - AMP + GradScaler optional   |
+                                                   | - best/final torch.save       |
+                                                   | - history CSV + plot          |
                                                    +-------------------------------+
-                                                             |
-                                                             v
-                                                    +-------------------------------+
-                                                    | common.PathResolver           |
-                                                    | - anchors relative paths      |
-                                                    | - outputs_root derivations    |
-                                                    |   (heatmaps, stitched, cm,    |
-                                                    |    checkpoints)               |
-                                                    +-------------------------------+
-                                                             |
-                                                             v
-                                                    +-------------------------------+
-                                                    | setup_folders.py             |
-                                                    | - collect/ensure dirs from   |
-                                                    |   config (shared helper)     |
-                                                    +-------------------------------+
+                                                                |
+                                                                v
+                                                   data/outputs/checkpoints/model-*.pth
 
-Model and data modules (CNN path)
+Inference + reports (postprocessing)
 
-+-----------------------+        used by         +----------------------+        used by        +--------------------+
-| vector_field_data.py  | <--------------------- | main.py / trainer.py  | -------------------> | cnn_optim.py       |
-| - load_vector_field   |                        | - tile slicing        |                      | - CnnOptim.build() |
-| - ensure_chw          |                        | - dataloaders         |                      |   -> optimizer,    |
-| - load_vector_field_  |                        |                       |                      |      scheduler     |
-|   tiles               |                        +----------------------+                       +--------------------+
-+-----------------------+                                 | uses
-                                                          v
-                                                +----------------------+
-                                                | cnn_model.py         |
-                                                | - SimpleCNN          |
-                                                | - count_parameters   |
-                                                +----------------------+
++---------+    +----------------------------+    tiles/probs/logits    +----------------------------+
+| infer.py| -> | InferenceRunner            | ----------------------> | data/outputs/heatmaps/*.png|
++---------+    | - loads weights + config   |                         | data/outputs/stitched*.png |
+               | - resolves channels        |                         | data/outputs/*.npy         |
+               | - image inference loop     |                         +----------------------------+
+               +-------------+--------------+
+                             |
+                             v
+                     +----------------------+
+                     | reports.py           |
+                     | - confusion matrices |
+                     | - summary CSVs/plots |
+                     +----------------------+
 
-Training path
+Heatmap viewer (optional)
 
-   CLI                                   uses                           orchestrates
-+--------+     +-------------------------------+      model ->       +----------------------+
-|train.py| --> | main.py: ConfigManager        |-------------------->| trainer.py: Trainer  |
-+--------+     | + ModelManager                |                     | - builds loaders     |
-               +-------------------------------+                     | - calls CnnOptim     |
-                                                                    | - trains/validates   |
-                                                                    | - saves checkpoints  |
-                                                                    | - writes training_settings.csv|
-                                                                    | - writes history CSV |
-                                                                    |   (with epoch/total time)    |
-                                                                    |   + progress plot    |
-                                                                    +----------------------+
-                                                                               |
-                                                                               | torch.save
-                                                                               v
-                                                                    +------------------------------+
-                                                                    | data/outputs/checkpoints/    |
-                                                                    |   model-*.pth                |
-                                                                    +------------------------------+
-
-Forward-only run (quick build + optional save)
-
-   CLI                                   builds/loads                         optional save
-+--------+     +-------------------------------+     forward pass      +------------------------------+
-| main.py| --> | ConfigManager + ModelManager  | --------------------> | data/outputs/checkpoints/    |
-+--------+     +-------------------------------+                       |   model-*.pth                |
-                                                                       +------------------------------+
-
-Inference path
-
-+------------------+      reads (default)            +----------------------------+
-| config.json      | <------------------------------ | infer.py: load_config      |
-+------------------+                                 +----------------------------+
-                                                                 |
-                                                                 v
-                                                       +----------------------------+
-   CLI                                                 | infer.py: InferenceRunner  |
-+---------+  device-> DeviceSelector                   | - resolve field + weights  |
-| infer.py | ----------------------------------------> | - infer_input_channels     |
-                                                  (vector) or
-                                                  | - image config channels      |
-+---------+                                            | - build SimpleCNN          |
-                                                       | - load_weights             |
-                                                       | - ensure_outputs_ready     |
-                                                       +-------------+--------------+
-                                                                     |
-                                                                     | tiles/probs/logits
-                                                                     v
-                                                       +----------------------------+
-| run_inference (vector)     |
-| - vector_field_data tiles  |
-| - model logits/probs/conf  |
-| - optional save CSV/NPY    |
-| - HeatmapGenerator         |
-|                            |
-| run_image_inference        |
-| - iterate test_image_dir   |
-| - per-image logits/probs   |
-| - optional predictions CSV |
-| - optional confusion matrix|
-                                                       +-------------+--------------+
-                                                                     |
-                                                              images/NPY outputs
-                                                                     v
-                                                       +----------------------------+
-                                                       | data/outputs/heatmaps/*.png|
-                                                       | data/outputs/stitched_*.png|
-                                                       | data/outputs/*.npy         |
-                                                       +----------------------------+
-
-Heatmap viewer
-
-+------------------+      reads (optional)          +-----------------------------+
-| config.json      | <----------------------------- | heatmap_viewer.py           |
-+------------------+                                | - load CSV/NPY values       |
-                                                    | - derive grid from          |
-                                                    |   field + tiling if needed  |
-                                                    | - save/show stitched image  |
-                                                    +-----------------------------+
++------------------+    reads    +-----------------------------+
+| config.json      | <---------  | heatmap_viewer.py           |
++------------------+             | - stitch/visualize outputs  |
+                                 +-----------------------------+
 
 Legend
-- Solid arrows: function calls/import usage at runtime.
+- Solid arrows: runtime function calls/import usage.
 - "reads" arrows: JSON config files read by tools.
 - "torch.save" arrows: checkpoints saved under data/outputs/checkpoints/.
 
 Notes
-- All paths are resolved via common.PathResolver; outputs_root controls where artifacts land.
-- All entry points accept --config and default to example_files/prototype two/config.json.
+- All paths resolved via common.PathResolver; outputs_root controls artifact location.
+- Entry points accept --config and default to example_files/prototype two/config.json.

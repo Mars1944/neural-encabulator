@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from common import ConfigManager
+from common import ConfigManager, DeviceSelector
 from console import console_from_config
 from main import ModelManager
 from trainer import Trainer
@@ -35,6 +35,12 @@ def main() -> None:
 
     # Ensure base folder structure exists (centralized helper)
     ensure_outputs_ready(cfg_mgr.path, cfg_mgr.config)
+
+    # Report the resolved device (GPU/CPU name)
+    try:
+        c.info(f"Using device: {DeviceSelector.format(cfg_mgr.device)}")
+    except Exception:
+        pass
 
     def _val_str(v: object) -> str:
         try:

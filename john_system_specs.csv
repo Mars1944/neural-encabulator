@@ -1,0 +1,44 @@
+section,John's laptop
+CPU Specs.platform,Windows
+CPU Specs.release,11
+CPU Specs.processor,"Intel64 Family 6 Model 191 Stepping 2, GenuineIntel"
+CPU Specs.os_bits,64bit
+CPU Specs.physical_cores,16
+CPU Specs.logical_cores,24
+CPU Specs.cpu_freq_current_mhz,2100
+CPU Specs.cpu_freq_max_mhz,2100
+CPU Specs.wmi_cpu[0].Name,13th Gen Intel(R) Core(TM) i7-13700HX
+CPU Specs.wmi_cpu[0].MaxClockSpeed,2100
+CPU Specs.wmi_cpu[0].CurrentClockSpeed,2100
+RAM Specs.total_gb,61.7
+RAM Specs.modules[0].manufacturer,Micron Technology
+RAM Specs.modules[0].rated_speed_mhz,5600
+RAM Specs.modules[0].configured_speed_mhz,4800
+RAM Specs.modules[0].capacity_gb,32
+RAM Specs.modules[1].manufacturer,Micron Technology
+RAM Specs.modules[1].rated_speed_mhz,5600
+RAM Specs.modules[1].configured_speed_mhz,4800
+RAM Specs.modules[1].capacity_gb,32
+GPU Specs[0].source,torch
+GPU Specs[0].index,0
+GPU Specs[0].name,NVIDIA GeForce RTX 4060 Laptop GPU
+GPU Specs[0].total_mem_gb,8
+GPU Specs[0].cuda_cc,8.9
+GPU Specs[1].source,nvidia-smi
+GPU Specs[1].index,0
+GPU Specs[1].name,NVIDIA GeForce RTX 4060 Laptop GPU
+GPU Specs[1].total_mem_mb,8188
+GPU Specs[1].free_mem_mb,6319
+GPU Specs[1].mem_clock_current_mhz,810
+GPU Specs[1].graphics_clock_current_mhz,390
+GPU Specs[1].mem_clock_max_mhz,8001
+GPU Specs[1].graphics_clock_max_mhz,3105
+GPU Specs[1].descriptions.total_mem_mb,Total VRAM (MB)
+GPU Specs[1].descriptions.free_mem_mb,Free VRAM (MB)
+GPU Specs[1].descriptions.mem_clock_current_mhz,Memory clock current (MHz)
+GPU Specs[1].descriptions.graphics_clock_current_mhz,Graphics clock current (MHz)
+GPU Specs[1].descriptions.mem_clock_max_mhz,Memory clock max (MHz)
+GPU Specs[1].descriptions.graphics_clock_max_mhz,Graphics clock max (MHz)
+Disk.disk_total_gb,1863
+Disk.disk_free_gb,514.38
+Python.version,"3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]"

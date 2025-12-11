@@ -7,7 +7,10 @@ import time
 import numpy as np
 import torch
 import torch.amp as torch_amp
-from torch.cuda.amp import GradScaler as CudaGradScaler
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None  # type: ignore
 
 from vector_field_data import (
     ensure_chw,
@@ -102,11 +105,19 @@ class Trainer:
             self.config["_config_dir"] = str(Path(self.config["_config_path"]).parent)
         self.device = device
         self.model = model.to(device)
+        self._ps_proc = psutil.Process() if psutil else None
         # AMP / memory format settings
         mp_cfg = str(self.config.get("mixed_precision", "")).lower()
         self.amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mp_cfg, None)
         self.use_amp = bool(self.amp_dtype) and self.device.type == "cuda"
-        self.grad_scaler = CudaGradScaler(enabled=self.use_amp)
+        # GradScaler signature differs across torch versions (device/device_type appeared in 2.4+)
+        try:
+            self.grad_scaler = torch_amp.GradScaler(
+                device="cuda" if self.device.type == "cuda" else "cpu",
+                enabled=self.use_amp,
+            )
+        except TypeError:
+            self.grad_scaler = torch_amp.GradScaler(enabled=self.use_amp)
         self._use_channels_last = bool(self.config.get("channels_last", False)) and self.device.type == "cuda"
         if self._use_channels_last:
             try:
@@ -222,6 +233,7 @@ class Trainer:
             if not isinstance(flow_csv, str) or not flow_csv.strip():
                 raise RuntimeError("train_flow_csv (or flow_csv) must be set for multitask image training")
             flow_csv_path = resolver.anchor(flow_csv)
+            norm_targets = bool(cfg.get("normalize_regression_targets", False))
             base_ds = PairedFlowDataset(
                 train_dir,
                 flow_csv_path,
@@ -233,6 +245,7 @@ class Trainer:
                 split_filter=None,
                 laminar_threshold=float(cfg.get("laminar_threshold", 2300.0)),
                 console=self.console,
+                normalize_targets=norm_targets,
             )
             splits = [item.get("split", "train") for item in base_ds.items] if hasattr(base_ds, "items") else []
             has_val_rows = any(str(s).lower() == "val" for s in splits)
@@ -260,6 +273,15 @@ class Trainer:
             ds_train = torch.utils.data.Subset(base_ds, tr_idx)
             ds_val = torch.utils.data.Subset(base_ds, va_idx)
             self.console.info(f"[split] multitask image dataset -> train={len(ds_train)}, val={len(ds_val)}")
+            # Persist regression normalization stats into config so they get saved with checkpoints and reused at inference
+            if norm_targets and hasattr(base_ds, "_reg_norm") and getattr(base_ds, "_reg_norm", None):
+                try:
+                    self.config["regression_norm"] = dict(getattr(base_ds, "_reg_norm"))
+                    self.console.info(
+                        "[reg_norm] Stored regression normalization stats in config for inference reuse."
+                    )
+                except Exception:
+                    pass
             limit_frac = float(cfg.get("debug_train_fraction", cfg.get("max_train_fraction", 1.0)))
             debug_enabled = bool(cfg.get("debug_limit_training", False))
             if debug_enabled and limit_frac > 0 and limit_frac < 1.0:
@@ -723,11 +745,22 @@ class Trainer:
         total_correct = 0
         total_seen = 0
         total_reg_mae = 0.0
+        epoch_start = time.time()
+        last_step_time = epoch_start
+        smoothed_ips = None
         non_blocking = bool(self.config.get("pin_memory", False))
         bar = None
         try:
             from tqdm import tqdm as _tqdm  # type: ignore
-            bar = _tqdm(loader, desc=f"train {epoch:03d}", unit="batch", dynamic_ncols=True, ascii=True, leave=False)
+            bar = _tqdm(
+                loader,
+                desc=f"train {epoch:03d}",
+                unit="batch",
+                dynamic_ncols=True,
+                ascii=True,
+                leave=False,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_noinv_fmt}{postfix}]",
+            )
         except Exception:
             bar = None
         iter_loader = bar if bar is not None else loader
@@ -780,7 +813,13 @@ class Trainer:
                     total_loss += float(loss.item()) * int(y.size(0))
             if bar is not None:
                 try:
-                    bar.set_postfix({"loss": f"{float(loss.item()):.4f}"})
+                    now = time.time()
+                    step_dt = max(now - last_step_time, 1e-6)
+                    last_step_time = now
+                    inst_ips = float(x.size(0)) / step_dt
+                    # Exponential moving average to stabilize the display
+                    smoothed_ips = inst_ips if smoothed_ips is None else (0.8 * smoothed_ips + 0.2 * inst_ips)
+                    bar.set_postfix({"loss": f"{float(loss.item()):.4f}", "img/s": f"{smoothed_ips:.1f}"})
                     bar.update(0)
                 except Exception:
                     pass
@@ -805,7 +844,15 @@ class Trainer:
         bar = None
         try:
             from tqdm import tqdm as _tqdm  # type: ignore
-            bar = _tqdm(loader, desc="val", unit="batch", dynamic_ncols=True, ascii=True, leave=False)
+            bar = _tqdm(
+                loader,
+                desc="val",
+                unit="batch",
+                dynamic_ncols=True,
+                ascii=True,
+                leave=False,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_noinv_fmt}{postfix}]",
+            )
         except Exception:
             bar = None
         iter_loader = bar if bar is not None else loader
@@ -891,13 +938,20 @@ class Trainer:
                 va_loss, va_acc, va_mae = self._eval(val_loader)
                 epoch_time = time.time() - epoch_start
                 total_time = time.time() - run_start
+                train_count = self._loader_size(train_loader)
+                imgs_per_sec = (train_count / epoch_time) if (train_count and epoch_time > 0) else None
                 mem = self._cuda_mem_stats()
+                sys_stats = self._sys_stats()
                 if self.is_multitask:
                     msg = f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} reg_mae={tr_mae:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} reg_mae={va_mae:.4f} | epoch_time={epoch_time:.2f}s total={total_time/60:.2f}m"
                 else:
                     msg = f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f} | epoch_time={epoch_time:.2f}s total={total_time/60:.2f}m"
+                if imgs_per_sec is not None:
+                    msg += f" | imgs/sec={imgs_per_sec:.1f}"
                 if mem:
                     msg += f" | cuda_mem alloc={mem.get('cuda_mem_alloc_mb', 0.0):.1f}MB peak={mem.get('cuda_mem_peak_mb', 0.0):.1f}MB reserved={mem.get('cuda_mem_reserved_mb', 0.0):.1f}MB"
+                if sys_stats:
+                    msg += f" | cpu={sys_stats.get('cpu_percent', 0.0):.1f}% ram={sys_stats.get('sys_ram_mb', 0.0):.0f}MB"
                 self.console.info(msg)
                 history.append(
                     {
@@ -912,6 +966,7 @@ class Trainer:
                         "epoch_time_sec": float(epoch_time),
                         "total_time_sec": float(total_time),
                         **mem,
+                        **sys_stats,
                     }
                 )
                 warm = getattr(self.optimizer, "_warmup_scheduler", None)
@@ -1099,11 +1154,18 @@ class Trainer:
             tr_loss, tr_acc = self._train_one_epoch(train_loader, epoch)
             va_loss, va_acc = self._eval(val_loader)
             epoch_time = time.time() - epoch_start
+            train_count = self._loader_size(train_loader)
+            imgs_per_sec = (train_count / epoch_time) if (train_count and epoch_time > 0) else None
             mem = self._cuda_mem_stats()
+            sys_stats = self._sys_stats()
             msg = f"epoch {epoch:03d} | train_loss={tr_loss:.6f} acc={tr_acc:.4f} | val_loss={va_loss:.6f} acc={va_acc:.4f}"
             msg += f" | epoch_time={epoch_time:.2f}s"
+            if imgs_per_sec is not None:
+                msg += f" | imgs/sec={imgs_per_sec:.1f}"
             if mem:
                 msg += f" | cuda_mem alloc={mem.get('cuda_mem_alloc_mb', 0.0):.1f}MB peak={mem.get('cuda_mem_peak_mb', 0.0):.1f}MB reserved={mem.get('cuda_mem_reserved_mb', 0.0):.1f}MB"
+            if sys_stats:
+                msg += f" | cpu={sys_stats.get('cpu_percent', 0.0):.1f}% ram={sys_stats.get('sys_ram_mb', 0.0):.0f}MB"
             self.console.info(msg)
             history.append(
                 {
@@ -1114,6 +1176,7 @@ class Trainer:
                     "val_acc": float(va_acc),
                     "lr": float(self._current_lr()),
                     "epoch_time_sec": float(epoch_time),
+                    **sys_stats,
                     **mem,
                 }
             )
@@ -1177,6 +1240,26 @@ class Trainer:
         except Exception:
             return 0.0
 
+    def _loader_size(self, loader: torch.utils.data.DataLoader) -> int | None:
+        try:
+            return len(loader.dataset)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+
+    def _sys_stats(self) -> dict:
+        try:
+            if self._ps_proc is None:
+                return {}
+            mem = self._ps_proc.memory_info()
+            cpu = self._ps_proc.cpu_percent(interval=None)
+            return {
+                "sys_ram_mb": float(mem.rss) / (1024.0 * 1024.0),
+                "sys_vms_mb": float(mem.vms) / (1024.0 * 1024.0),
+                "cpu_percent": float(cpu),
+            }
+        except Exception:
+            return {}
+
     def _cuda_mem_stats(self) -> Dict[str, float]:
         """Return current/peak CUDA memory stats in MB (empty dict if not on CUDA)."""
         try:
@@ -1235,6 +1318,12 @@ class Trainer:
             extra_fields.append("cuda_mem_reserved_mb")
         if history and any("cuda_mem_peak_mb" in h for h in history):
             extra_fields.append("cuda_mem_peak_mb")
+        if history and any("sys_ram_mb" in h for h in history):
+            extra_fields.append("sys_ram_mb")
+        if history and any("sys_vms_mb" in h for h in history):
+            extra_fields.append("sys_vms_mb")
+        if history and any("cpu_percent" in h for h in history):
+            extra_fields.append("cpu_percent")
         return base_fields + extra_fields
 
     def _write_training_history_csv(self, history: List[Dict[str, float]], csv_path: Path) -> None:

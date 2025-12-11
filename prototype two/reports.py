@@ -297,12 +297,42 @@ def _generate_plots(
             return pad + out
         return arr
 
+    def _butter_filter(arr: List[float], order: int = 6, cutoff: float = 0.1) -> List[float] | None:
+        """
+        Apply a low-pass Butterworth filter (filtfilt) to smooth the sequence.
+        cutoff is normalized to Nyquist (0<cutoff<1).
+        """
+        try:
+            # Skip known-incompatible SciPy if NumPy 2.x is installed and SciPy wheels are outdated
+            np_ver = tuple(int(p) for p in np.__version__.split(".")[:2] if p.isdigit())
+            if np_ver and np_ver[0] >= 2:
+                try:
+                    import importlib.util as _ilu  # type: ignore
+                    if _ilu.find_spec("scipy") is not None:
+                        console.warn("[reports] Skipping Butterworth filter: SciPy wheels likely incompatible with NumPy 2.x (saw NumPy "
+                                     f"{np.__version__}). Install scipy built for NumPy 2.x or downgrade NumPy (<2).")
+                except Exception:
+                    pass
+                return None
+            import scipy.signal as _sig  # type: ignore
+            if len(arr) < order + 2:
+                return None
+            b, a = _sig.butter(order, cutoff, btype="low", analog=False)
+            filtered = _sig.filtfilt(b, a, np.asarray(arr, dtype=float))
+            return filtered.tolist()
+        except Exception as e:
+            try:
+                console.warn(f"[reports] Butterworth filter unavailable: {e}")
+            except Exception:
+                pass
+            return None
+
     if vel_vals:
+        x_vals = list(range(1, len(vel_vals) + 1))
         try:
             vel_avg = _rolling_mean(vel_vals, window=3)
             vel_avg10 = _rolling_mean(vel_vals, window=10)
             vel_avg100 = _rolling_mean(vel_vals, window=100)
-            x_vals = list(range(1, len(vel_vals) + 1))
             fit_100 = None
             if len(vel_vals) >= 100:
                 try:
@@ -334,12 +364,31 @@ def _generate_plots(
             _plt.close()
         except Exception as e:
             console.warn(f"[reports] failed to plot velocity predictions: {e}")
+        # Butterworth-smoothed velocity plot
+        vel_butter = _butter_filter(vel_vals, order=6, cutoff=0.1)
+        if vel_butter:
+            try:
+                _plt.figure(figsize=(6, 4))
+                _plt.plot(x_vals, vel_vals, color="#B0C4DE", linewidth=1.0, alpha=0.5, label="velocity (raw)")
+                _plt.plot(x_vals, vel_butter, color="#FFD700", linewidth=1.4, label="velocity (6th-order Butterworth)")
+                _plt.xlabel("image index")
+                _plt.ylabel("velocity (predicted)")
+                _plt.title("Velocity (Butterworth smoothed)")
+                _plt.grid(alpha=0.3, linestyle="--", linewidth=0.5)
+                _plt.legend()
+                out_vel_b = plots_dir / "velocity_butterworth.png"
+                console.info(f"[reports] plotting Butterworth velocity -> {out_vel_b}")
+                _plt.tight_layout()
+                _plt.savefig(out_vel_b, dpi=150)
+                _plt.close()
+            except Exception as e:
+                console.warn(f"[reports] failed to plot Butterworth velocity: {e}")
     if re_vals:
+        x_vals = list(range(1, len(re_vals) + 1))
         try:
             re_avg = _rolling_mean(re_vals, window=3)
             re_avg10 = _rolling_mean(re_vals, window=10)
             re_avg100 = _rolling_mean(re_vals, window=100)
-            x_vals = list(range(1, len(re_vals) + 1))
             fit_100 = None
             if len(re_vals) >= 100:
                 try:
@@ -370,6 +419,25 @@ def _generate_plots(
             _plt.close()
         except Exception as e:
             console.warn(f"[reports] failed to plot Reynolds predictions: {e}")
+        # Butterworth-smoothed Reynolds plot
+        re_butter = _butter_filter(re_vals, order=6, cutoff=0.1)
+        if re_butter:
+            try:
+                _plt.figure(figsize=(6, 4))
+                _plt.plot(x_vals, re_vals, color="#F5B7B1", linewidth=1.0, alpha=0.5, label="Re (raw)")
+                _plt.plot(x_vals, re_butter, color="#FFD700", linewidth=1.4, label="Re (6th-order Butterworth)")
+                _plt.xlabel("image index")
+                _plt.ylabel("Reynolds number (predicted)")
+                _plt.title("Reynolds (Butterworth smoothed)")
+                _plt.grid(alpha=0.3, linestyle="--", linewidth=0.5)
+                _plt.legend()
+                out_re_b = plots_dir / "reynolds_butterworth.png"
+                console.info(f"[reports] plotting Butterworth Reynolds -> {out_re_b}")
+                _plt.tight_layout()
+                _plt.savefig(out_re_b, dpi=150)
+                _plt.close()
+            except Exception as e:
+                console.warn(f"[reports] failed to plot Butterworth Reynolds: {e}")
 
     if mapping:
         lower_name_map = {name.lower(): name for name in mapping.keys()}
@@ -430,6 +498,8 @@ def _maybe_plot_training_progress(*, base_dir: Path, config: Dict[str, Any], con
                             "val_loss": float(row.get("val_loss", 0.0)),
                             "train_acc": float(row.get("train_acc", 0.0)),
                             "val_acc": float(row.get("val_acc", 0.0)),
+                            "epoch_time_sec": float(row.get("epoch_time_sec", row.get("epoch_time", 0.0)) or 0.0),
+                            "total_time_sec": float(row.get("total_time_sec", 0.0) or 0.0),
                         }
                     )
                 except Exception:
@@ -441,11 +511,62 @@ def _maybe_plot_training_progress(*, base_dir: Path, config: Dict[str, Any], con
         console.warn(f"[reports] Failed to parse training history CSV '{csv_path}': {e}")
         return
 
-    out_png = (base_dir / "training" / "training_progress.png").resolve()
+    training_dir = (base_dir / "training").resolve()
+    training_dir.mkdir(parents=True, exist_ok=True)
+    out_png = (training_dir / "training_progress.png").resolve()
     model_name = str(config.get("model_name", config.get("model_type", ""))).strip()
     custom_title = f"Training Progress - {model_name}" if model_name else "Training Progress"
     console.info(f"[reports] plotting training progress -> {out_png}")
     plot_training_progress(history_rows, out_png, console=console, title=custom_title)
+
+    # Additional plot: epoch vs accuracy (%) with per-epoch and total time
+    try:
+        import matplotlib.pyplot as _plt  # type: ignore
+
+        epochs = [r.get("epoch", i + 1) for i, r in enumerate(history_rows)]
+        train_acc = [float(r.get("train_acc", 0.0)) * 100.0 for r in history_rows]
+        val_acc = [float(r.get("val_acc", 0.0)) * 100.0 for r in history_rows]
+        epoch_time = [float(r.get("epoch_time_sec", 0.0)) for r in history_rows]
+        total_time = [float(r.get("total_time_sec", 0.0)) for r in history_rows]
+        # If total_time not recorded, derive cumulative from epoch_time
+        if not any(t > 0 for t in total_time) and any(et > 0 for et in epoch_time):
+            cum = 0.0
+            total_time = []
+            for et in epoch_time:
+                cum += et
+                total_time.append(cum)
+        epoch_time_min = [t / 60.0 for t in epoch_time] if any(t > 0 for t in epoch_time) else None
+        total_time_min = [t / 60.0 for t in total_time] if any(t > 0 for t in total_time) else None
+
+        _plt.figure(figsize=(8, 5))
+        ax1 = _plt.gca()
+        ax1.plot(epochs, train_acc, label="Train acc (%)", color="#1f77b4", marker="o", markersize=3)
+        if any(val_acc):
+            ax1.plot(epochs, val_acc, label="Val acc (%)", color="#d62728", marker="^", markersize=3)
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Accuracy (%)")
+        ax1.grid(alpha=0.3, linestyle="--", linewidth=0.5)
+
+        if total_time_min:
+            ax2 = ax1.twinx()
+            if total_time_min:
+                ax2.plot(epochs, total_time_min, label="Total time (min)", color="#9467bd", linestyle="-.")
+            ax2.set_ylabel("Time (minutes)")
+            # Combine legends
+            lines, labels = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines + lines2, labels + labels2, loc="lower right")
+        else:
+            ax1.legend(loc="lower right")
+
+        extra_out = (training_dir / "training_accuracy_time.png").resolve()
+        _plt.title(custom_title + " (Accuracy & Time)")
+        _plt.tight_layout()
+        _plt.savefig(extra_out, dpi=150)
+        _plt.close()
+        console.info(f"[reports] plotting training accuracy/time -> {extra_out}")
+    except Exception as e:
+        console.warn(f"[reports] Failed to plot training accuracy/time: {e}")
 
 
 def generate_image_reports(

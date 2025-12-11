@@ -784,6 +784,21 @@ def run_image_inference(
                 reg = None
             probs = torch.softmax(logits, dim=1).detach().cpu().numpy()
             reg_np = reg.detach().cpu().numpy() if reg is not None else None
+            # Optional inverse regression normalization
+            reg_norm = config.get("regression_norm", None)
+            if reg_np is not None and isinstance(reg_norm, dict):
+                try:
+                    v_mean = float(reg_norm.get("v_mean", 0.0))
+                    v_std = float(reg_norm.get("v_std", 1.0))
+                    r_mean = float(reg_norm.get("r_mean", 0.0))
+                    r_std = float(reg_norm.get("r_std", 1.0))
+                    reg_np = reg_np.copy()
+                    if reg_np.shape[1] >= 1:
+                        reg_np[:, 0] = reg_np[:, 0] * v_std + v_mean
+                    if reg_np.shape[1] >= 2:
+                        reg_np[:, 1] = reg_np[:, 1] * r_std + r_mean
+                except Exception:
+                    pass
         for i, pth in enumerate(batch_paths):
             prob_i = probs[i]
             pred_idx = int(np.argmax(prob_i))
