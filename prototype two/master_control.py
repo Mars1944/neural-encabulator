@@ -12,6 +12,7 @@ The config file should include an "mcp" section with booleans:
     "run_reports": true
   }
 }
+this is me changing a thing so git will update the repo
 """
 
 from __future__ import annotations
