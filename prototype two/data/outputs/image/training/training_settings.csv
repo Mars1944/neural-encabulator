@@ -1,0 +1,84 @@
+key,value
+add_magnitude,True
+allow_tf32,True
+batch_size,48
+channels_last,False
+class_names,"['turbulent', 'laminar']"
+cm_csv,data/outputs/image/confusion_matrix.csv
+cm_png,data/outputs/image/confusion_matrix.png
+conv_channels,"[32, 64, 128, 256]"
+data,"{'data_kind': 'image', 'train_image_dir': 'data/training data/image/training_image_root.txt', 'test_image_dir': 'data/testing data/testing_image_root.txt', 'image_size': [256, 256], 'image_channels': 1, 'tile_size': [256, 256], 'tile_stride': [256, 256], 'add_magnitude': True, 'normalize': True, 'limit_tiles': None}"
+data_kind,image
+debug_limit_training,False
+debug_train_fraction,0.2
+device,auto
+dilations,"[1, 2, 4, 4]"
+dropout,0.1
+file_labels,C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/testing_data/file_name.csv
+file_summary,data/outputs/image/file_predictions.csv
+generate_confusion_matrix,True
+generate_heatmap,True
+heatmap_class,0
+heatmaps_dir,data/outputs/heatmaps
+image_channels,1
+image_include_classes,[]
+image_infer_batch_size,32
+image_mean,[0.5]
+image_root,data/testing data/testing_image_root.txt
+image_size,"[256, 256]"
+image_std,[0.5]
+inference,"{'common': {'data_kind': 'image', 'use_test': True, 'file_labels': 'C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/testing_data/file_name.csv', 'file_summary': 'data/outputs/image/file_predictions.csv', 'recurse': True, 'generate_heatmap': True, 'generate_confusion_matrix': True, 'show_heatmap': False, 'heatmap_class': 0, 'cm_csv': 'data/outputs/image/confusion_matrix.csv', 'cm_png': 'data/outputs/image/confusion_matrix.png', 'heatmaps_dir': 'data/outputs/heatmaps', 'stitched_heatmap': 'data/outputs/stitched_heatmap.png', 'class_names': ['turbulent', 'laminar'], 'mixed_precision': 'fp16', 'channels_last': True, 'pin_memory': True, 'prefetch_workers': 0, 'torch_compile': False, 'use_inference_mode': True, 'allow_tf32': True, 'use_opencv_loader': False, 'plot_top_n': 50, 'image_include_classes': []}, 'image': {'image_infer_batch_size': 32}, 'vector': {'inference_tile_size': [77, 128], 'inference_tile_stride': [77, 32]}}"
+kernel_size,3
+learning_rate,1e-05
+limit_tiles,
+loss_weight_cls,1.0
+loss_weight_reg,0.1
+max_epochs,250
+mcp,"{'run_train': True, 'run_infer': True, 'run_reports': True, 'run_bench_optimize': False}"
+mixed_precision,fp16
+model,"{'num_classes': 2, 'conv_channels': [32, 64, 128, 256], 'kernel_size': 3, 'pool_every': 1, 'dropout': 0.1, 'use_batchnorm': True, 'dilations': [1, 2, 4, 4]}"
+model_type,cnn
+normalize,True
+normalize_regression_targets,True
+num_classes,2
+num_workers,4
+optimizer,adamw
+outputs_root,data/outputs
+paths,{'outputs_root': 'data/outputs'}
+pin_memory,True
+plot_top_n,50
+pool_every,1
+predictions_csv,data/outputs/image/file_predictions.csv
+prefetch_workers,0
+recurse,True
+reports,"{'predictions_csv': 'data/outputs/image/file_predictions.csv', 'image_root': 'data/testing data/testing_image_root.txt', 'subdir': 'image', 'cm_csv': 'data/outputs/image/confusion_matrix.csv', 'cm_png': 'data/outputs/image/confusion_matrix.png'}"
+scheduler,plateau
+scheduler_params,"{'factor': 0.5, 'patience': 2, 'min_lr': 1e-07, 'threshold': 0.0001}"
+seed,42
+show_heatmap,False
+stitched_heatmap,data/outputs/stitched_heatmap.png
+subdir,image
+task,multitask
+test_image_dir,C:\Users\Owner\Documents\Grad School\Fall 2025\ME 521 - CPTS 534 Project\neural-encabulator\prototype two\data\testing data\testing_image_root.txt
+tile_size,"[256, 256]"
+tile_stride,"[256, 256]"
+torch_compile,False
+train_flow_csv,C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/training data/metadata_set_one.csv
+train_image_dir,C:\Users\Owner\Documents\Grad School\Fall 2025\ME 521 - CPTS 534 Project\neural-encabulator\prototype two\data\training data\image\training_image_root.txt
+train_source_labels,"[2, 1]"
+training,"{'task': 'multitask', 'train_flow_csv': 'C:/Users/Owner/Documents/Grad School/Fall 2025/ME 521 - CPTS 534 Project/neural_encabulator_training_testing_data/training data/metadata_set_one.csv', 'debug_limit_training': False, 'debug_train_fraction': 0.2, 'batch_size': 48, 'num_workers': 4, 'pin_memory': True, 'mixed_precision': 'fp16', 'channels_last': False, 'loss_weight_cls': 1.0, 'loss_weight_reg': 0.1, 'val_source_labels': [0, 1], 'val_split': 0.2, 'learning_rate': 1e-05, 'weight_decay': 0.0, 'normalize_regression_targets': True, 'optimizer': 'adamw', 'scheduler': 'plateau', 'scheduler_params': {'factor': 0.5, 'patience': 2, 'min_lr': 1e-07, 'threshold': 0.0001}, 'max_epochs': 250, 'train_source_labels': [2, 1]}"
+use_batchnorm,True
+use_inference_mode,True
+use_opencv_loader,False
+use_test,False
+val_source_labels,"[0, 1]"
+val_split,0.2
+viewer,"{'viewer_values_csv': 'data/testing data/heatmap_values_example.csv', 'viewer_title': 'Stitched Heatmap (Example)', 'viewer_cmap': 'viridis', 'viewer_no_show': False, 'viewer_save': 'data/outputs/viewer_heatmap.png', 'viewer_rows': 4, 'viewer_cols': 4}"
+viewer_cmap,viridis
+viewer_cols,4
+viewer_no_show,False
+viewer_rows,4
+viewer_save,data/outputs/viewer_heatmap.png
+viewer_title,Stitched Heatmap (Example)
+viewer_values_csv,data/testing data/heatmap_values_example.csv
+weight_decay,0.0

@@ -1,0 +1,52 @@
+section,value
+CPU Specs.platform,Windows
+CPU Specs.release,11
+CPU Specs.processor,"Intel64 Family 6 Model 186 Stepping 2, GenuineIntel"
+CPU Specs.os_bits,64bit
+CPU Specs.physical_cores,12
+CPU Specs.logical_cores,16
+CPU Specs.cpu_freq_current_mhz,2200.0
+CPU Specs.cpu_freq_max_mhz,2200.0
+CPU Specs.wmi_cpu[0].Name,13th Gen Intel(R) Core(TM) i7-1360P
+CPU Specs.wmi_cpu[0].MaxClockSpeed,2200
+CPU Specs.wmi_cpu[0].CurrentClockSpeed,2200
+RAM Specs.total_gb,15.7
+RAM Specs.modules[0].manufacturer,Samsung
+RAM Specs.modules[0].rated_speed_mhz,4267
+RAM Specs.modules[0].configured_speed_mhz,4267
+RAM Specs.modules[0].capacity_gb,2.0
+RAM Specs.modules[1].manufacturer,Samsung
+RAM Specs.modules[1].rated_speed_mhz,4267
+RAM Specs.modules[1].configured_speed_mhz,4267
+RAM Specs.modules[1].capacity_gb,2.0
+RAM Specs.modules[2].manufacturer,Samsung
+RAM Specs.modules[2].rated_speed_mhz,4267
+RAM Specs.modules[2].configured_speed_mhz,4267
+RAM Specs.modules[2].capacity_gb,2.0
+RAM Specs.modules[3].manufacturer,Samsung
+RAM Specs.modules[3].rated_speed_mhz,4267
+RAM Specs.modules[3].configured_speed_mhz,4267
+RAM Specs.modules[3].capacity_gb,2.0
+RAM Specs.modules[4].manufacturer,Samsung
+RAM Specs.modules[4].rated_speed_mhz,4267
+RAM Specs.modules[4].configured_speed_mhz,4267
+RAM Specs.modules[4].capacity_gb,2.0
+RAM Specs.modules[5].manufacturer,Samsung
+RAM Specs.modules[5].rated_speed_mhz,4267
+RAM Specs.modules[5].configured_speed_mhz,4267
+RAM Specs.modules[5].capacity_gb,2.0
+RAM Specs.modules[6].manufacturer,Samsung
+RAM Specs.modules[6].rated_speed_mhz,4267
+RAM Specs.modules[6].configured_speed_mhz,4267
+RAM Specs.modules[6].capacity_gb,2.0
+RAM Specs.modules[7].manufacturer,Samsung
+RAM Specs.modules[7].rated_speed_mhz,4267
+RAM Specs.modules[7].configured_speed_mhz,4267
+RAM Specs.modules[7].capacity_gb,2.0
+GPU Specs[0].source,powershell
+GPU Specs[0].raw,"Name                         AdapterRAM
+----                         ----------
+Intel(R) Iris(R) Xe Graphics 2147479552"
+Disk.disk_total_gb,457.65
+Disk.disk_free_gb,289.54
+Python.version,"3.13.5 | packaged by Anaconda, Inc. | (main, Jun 12 2025, 16:37:03) [MSC v.1929 64 bit (AMD64)]"
